@@ -5,15 +5,18 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 import hashlib
+import uuid
 from typing import Any
 
 from .config import AppConfig
 from .db import bootstrap, connect
+from .embeddings import EmbeddingProvider, build_embedding_provider
 from .fileio import write_atomic
 from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
 from .renderer import render_note
 from .schemas import MemoryInput
+from .vector_index import SQLiteVectorIndex, VectorIndex
 
 
 LOGGER = logging.getLogger("mnema_memory")
@@ -25,6 +28,10 @@ class MemoryService:
         self.config.vault_root.mkdir(parents=True, exist_ok=True)
         self.conn: sqlite3.Connection = connect(config.sqlite_path)
         bootstrap(self.conn)
+        self.embedding_provider: EmbeddingProvider = build_embedding_provider(
+            config.embedding_provider, config.embedding_model
+        )
+        self.vector_index: VectorIndex = SQLiteVectorIndex(self.conn)
         self.router = ToolRouter()
         self._register_tools()
 
@@ -82,16 +89,36 @@ class MemoryService:
                 memory_input.importance,
             ),
         )
+        embedding_id = f"emb-{uuid.uuid4().hex}"
+        checksum = hashlib.sha256(memory_input.content.encode("utf-8")).hexdigest()
+        created_at = datetime.now(tz=timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO embeddings (embedding_id, memory_id, provider, model, dim, checksum, created_at, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL)
+            """,
+            (
+                embedding_id,
+                memory_id,
+                self.config.embedding_provider,
+                self.config.embedding_model,
+                0,
+                checksum,
+                created_at,
+            ),
+        )
         for tag in sorted(set(memory_input.tags)):
             self.conn.execute(
                 "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                 (memory_id, tag),
             )
         self.conn.commit()
+        embedding_status = self._process_embedding(memory_id, embedding_id, memory_input.content)
         return {
             "memory_id": memory_id,
             "file_path": str(note_path),
-            "embedding_status": "pending",
+            "embedding_status": embedding_status,
+            "embedding_id": embedding_id,
         }
 
     def _list_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -138,7 +165,53 @@ class MemoryService:
         }
 
     def _recall_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("memory.recall is not implemented yet")
+        namespace = str(payload.get("namespace", self.config.default_namespace))
+        self._validate_namespace(namespace)
+        query = str(payload["query"])
+        top_k = int(payload.get("top_k", 10))
+        agent_id = payload.get("agent_id")
+        query_vector = self.embedding_provider.embed_texts([query])[0]
+        candidate_scores = self.vector_index.search(query_vector, top_k * 5)
+        if not candidate_scores:
+            return {"items": []}
+        score_by_embedding = {embedding_id: score for embedding_id, score in candidate_scores}
+        placeholders = ",".join("?" for _ in score_by_embedding.keys())
+        params: list[Any] = [*score_by_embedding.keys(), namespace]
+        query_sql = (
+            "SELECT e.embedding_id, m.id, m.namespace, m.agent_id, m.type, m.timestamp, "
+            "m.title, m.path, m.importance "
+            "FROM embeddings e JOIN memories m ON m.id = e.memory_id "
+            f"WHERE e.embedding_id IN ({placeholders}) AND m.namespace = ? AND m.deleted_at IS NULL"
+        )
+        if agent_id:
+            query_sql += " AND m.agent_id = ?"
+            params.append(str(agent_id))
+        rows = self.conn.execute(query_sql, params).fetchall()
+        results: list[dict[str, Any]] = []
+        now = datetime.now(tz=timezone.utc)
+        for row in rows:
+            created_at = datetime.fromisoformat(row["timestamp"])
+            age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
+            recency_score = 1.0 / (1.0 + age_days)
+            vector_score = score_by_embedding.get(row["embedding_id"], 0.0)
+            final_score = (0.7 * vector_score) + (0.2 * recency_score) + (0.1 * row["importance"])
+            excerpt = self._read_excerpt(Path(row["path"]))
+            results.append(
+                {
+                    "memory_id": row["id"],
+                    "embedding_id": row["embedding_id"],
+                    "namespace": row["namespace"],
+                    "agent_id": row["agent_id"],
+                    "type": row["type"],
+                    "timestamp": row["timestamp"],
+                    "title": row["title"],
+                    "path": row["path"],
+                    "score": final_score,
+                    "excerpt": excerpt,
+                }
+            )
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return {"items": results[:top_k]}
 
     def _summarize_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("memory.summarize is not implemented yet")
@@ -194,3 +267,31 @@ class MemoryService:
             raise ValueError("namespace is required")
         if ".." in namespace:
             raise ValueError("namespace contains invalid traversal sequence")
+
+    def _process_embedding(self, memory_id: str, embedding_id: str, content: str) -> str:
+        try:
+            vector = self.embedding_provider.embed_texts([content])[0]
+        except Exception as exc:
+            self.conn.execute(
+                "UPDATE embeddings SET status='failed', error=? WHERE embedding_id=?",
+                (str(exc), embedding_id),
+            )
+            self.conn.commit()
+            LOGGER.exception("Embedding generation failed for memory_id=%s", memory_id)
+            return "failed"
+        self.vector_index.upsert(embedding_id, vector)
+        self.conn.execute(
+            "UPDATE embeddings SET status='completed', dim=?, error=NULL WHERE embedding_id=?",
+            (len(vector), embedding_id),
+        )
+        self.conn.commit()
+        return "completed"
+
+    def _read_excerpt(self, note_path: Path, max_chars: int = 240) -> str:
+        text = note_path.read_text(encoding="utf-8")
+        if "---\n" in text:
+            parts = text.split("---\n")
+            body = "---\n".join(parts[2:]).strip()
+        else:
+            body = text
+        return body[:max_chars]

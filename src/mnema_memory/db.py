@@ -54,6 +54,12 @@ def bootstrap(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(memory_id) REFERENCES memories(id)
         );
 
+        CREATE TABLE IF NOT EXISTS embedding_vectors (
+            embedding_id TEXT PRIMARY KEY,
+            vector_json TEXT NOT NULL,
+            FOREIGN KEY(embedding_id) REFERENCES embeddings(embedding_id)
+        );
+
         CREATE TABLE IF NOT EXISTS ingest_jobs (
             id TEXT PRIMARY KEY,
             memory_id TEXT NOT NULL,
