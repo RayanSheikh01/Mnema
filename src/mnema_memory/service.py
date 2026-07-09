@@ -16,7 +16,7 @@ from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
 from .renderer import render_note
 from .schemas import MemoryInput
-from .vector_index import SQLiteVectorIndex, VectorIndex
+from .vector_index import VectorIndex, build_vector_index
 
 
 LOGGER = logging.getLogger("mnema_memory")
@@ -31,7 +31,9 @@ class MemoryService:
         self.embedding_provider: EmbeddingProvider = build_embedding_provider(
             config.embedding_provider, config.embedding_model
         )
-        self.vector_index: VectorIndex = SQLiteVectorIndex(self.conn)
+        self.vector_index: VectorIndex = build_vector_index(
+            config.vector_backend, self.conn, config
+        )
         self.router = ToolRouter()
         self._register_tools()
 
@@ -226,7 +228,7 @@ class MemoryService:
         top_k = int(payload.get("top_k", 10))
         agent_id = payload.get("agent_id")
         query_vector = self.embedding_provider.embed_texts([query])[0]
-        candidate_scores = self.vector_index.search(query_vector, top_k * 5)
+        candidate_scores = self.vector_index.search(query_vector, top_k * 5, namespace)
         if not candidate_scores:
             return {"items": []}
         score_by_embedding = {embedding_id: score for embedding_id, score in candidate_scores}
@@ -494,13 +496,22 @@ class MemoryService:
             self.conn.commit()
             LOGGER.exception("Embedding generation failed for memory_id=%s", memory_id)
             return "failed"
-        self.vector_index.upsert(embedding_id, vector)
+        namespace = self._namespace_for_memory(memory_id)
+        self.vector_index.upsert(embedding_id, vector, namespace)
         self.conn.execute(
             "UPDATE embeddings SET status='completed', dim=?, error=NULL WHERE embedding_id=?",
             (len(vector), embedding_id),
         )
         self.conn.commit()
         return "completed"
+
+    def _namespace_for_memory(self, memory_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT namespace FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"memory not found for embedding upsert: {memory_id}")
+        return row["namespace"]
 
     def _tags_for_memories(self, memory_ids: list[str]) -> dict[str, set[str]]:
         if not memory_ids:
