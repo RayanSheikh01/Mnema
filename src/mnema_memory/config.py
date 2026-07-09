@@ -34,7 +34,12 @@ class AppConfig:
     default_namespace: str = "default/project/dev"
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-small"
-    vector_backend: str = "inmemory"
+    vector_backend: str = "numpy"
+    dedup_enabled: bool = True
+    dedup_threshold: float = 0.95
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 200
+    hnsw_ef: int = 64
 
     @staticmethod
     def load(config_path: Path | None = None) -> "AppConfig":
@@ -60,8 +65,26 @@ class AppConfig:
             "MNEMA_EMBEDDING_MODEL", file_data.get("embedding_model", "text-embedding-3-small")
         )
         vector_backend = os.environ.get(
-            "MNEMA_VECTOR_BACKEND", file_data.get("vector_backend", "inmemory")
+            "MNEMA_VECTOR_BACKEND", file_data.get("vector_backend", "numpy")
         )
+
+        def _bool(value: object, default: bool) -> bool:
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        dedup_enabled = _bool(
+            os.environ.get("MNEMA_DEDUP_ENABLED", file_data.get("dedup_enabled")),
+            True,
+        )
+        dedup_threshold = float(
+            os.environ.get("MNEMA_DEDUP_THRESHOLD", file_data.get("dedup_threshold", 0.95))
+        )
+        hnsw_m = int(os.environ.get("MNEMA_HNSW_M", file_data.get("hnsw_m", 16)))
+        hnsw_ef_construction = int(
+            os.environ.get("MNEMA_HNSW_EF_CONSTRUCTION", file_data.get("hnsw_ef_construction", 200))
+        )
+        hnsw_ef = int(os.environ.get("MNEMA_HNSW_EF", file_data.get("hnsw_ef", 64)))
 
         return AppConfig(
             vault_root=vault_root,
@@ -70,4 +93,9 @@ class AppConfig:
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
             vector_backend=vector_backend,
+            dedup_enabled=dedup_enabled,
+            dedup_threshold=dedup_threshold,
+            hnsw_m=hnsw_m,
+            hnsw_ef_construction=hnsw_ef_construction,
+            hnsw_ef=hnsw_ef,
         )
