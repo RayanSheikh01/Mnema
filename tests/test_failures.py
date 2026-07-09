@@ -64,6 +64,31 @@ def test_recall_provider_failure_raises_not_empty() -> None:
     svc.close()
 
 
+def test_recall_works_after_index_rebuild() -> None:
+    # Rebuilding the index from the vault must restore embeddings/vectors,
+    # otherwise recall silently returns nothing after a rebuild.
+    svc = build_service()
+    svc.router.call(
+        "memory.remember",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "content": "alpha beta gamma"},
+    )
+    before = svc.router.call(
+        "memory.recall",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "query": "alpha beta gamma"},
+    )
+    assert len(before["items"]) == 1
+
+    result = svc.rebuild_index_from_vault()
+    assert result["rebuilt_memories"] == 1
+
+    after = svc.router.call(
+        "memory.recall",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "query": "alpha beta gamma"},
+    )
+    assert len(after["items"]) == 1
+    svc.close()
+
+
 def test_partial_write_leaves_original_intact(monkeypatch: pytest.MonkeyPatch) -> None:
     root = Path(tempfile.mkdtemp())
     note = root / "note.md"
