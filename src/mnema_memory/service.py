@@ -16,7 +16,7 @@ from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
 from .renderer import render_note
 from .schemas import MemoryInput
-from .vector_index import SQLiteVectorIndex, VectorIndex
+from .vector_index import VectorIndex, build_vector_index
 
 
 LOGGER = logging.getLogger("mnema_memory")
@@ -31,7 +31,9 @@ class MemoryService:
         self.embedding_provider: EmbeddingProvider = build_embedding_provider(
             config.embedding_provider, config.embedding_model
         )
-        self.vector_index: VectorIndex = SQLiteVectorIndex(self.conn)
+        self.vector_index: VectorIndex = build_vector_index(
+            config.vector_backend, self.conn, config
+        )
         self.router = ToolRouter()
         self._register_tools()
 
@@ -104,6 +106,27 @@ class MemoryService:
                 "file_path": existing["path"],
                 "embedding_status": "existing",
             }
+        # Semantic near-duplicate gate: if the content embeds close to an
+        # existing live memory in this namespace, skip the write and return it.
+        # The computed vector is reused for the real embedding record on a miss
+        # so the same text is never embedded twice.
+        precomputed_vector: list[float] | None = None
+        if self.config.dedup_enabled:
+            duplicate, precomputed_vector = self._find_semantic_duplicate(
+                memory_input.namespace, memory_input.agent_id, memory_input.content
+            )
+            if duplicate is not None:
+                LOGGER.info(
+                    "remember dedup hit request_id=%s memory_id=%s score=%.4f",
+                    request_id,
+                    duplicate["id"],
+                    duplicate["score"],
+                )
+                return {
+                    "memory_id": duplicate["id"],
+                    "file_path": duplicate["path"],
+                    "embedding_status": "duplicate",
+                }
         rendered = render_note(frontmatter, memory_input.content)
         lock_path = note_path.with_suffix(note_path.suffix + ".lock")
         with file_lock(lock_path):
@@ -161,7 +184,7 @@ class MemoryService:
             )
         self.conn.commit()
         embedding_id, embedding_status = self._create_embedding_record(
-            memory_id, memory_input.content
+            memory_id, memory_input.content, precomputed_vector
         )
         LOGGER.info(
             "remember completed request_id=%s memory_id=%s status=%s",
@@ -226,7 +249,7 @@ class MemoryService:
         top_k = int(payload.get("top_k", 10))
         agent_id = payload.get("agent_id")
         query_vector = self.embedding_provider.embed_texts([query])[0]
-        candidate_scores = self.vector_index.search(query_vector, top_k * 5)
+        candidate_scores = self.vector_index.search(query_vector, top_k * 5, namespace)
         if not candidate_scores:
             return {"items": []}
         score_by_embedding = {embedding_id: score for embedding_id, score in candidate_scores}
@@ -424,8 +447,13 @@ class MemoryService:
         if ".." in namespace:
             raise ValueError("namespace contains invalid traversal sequence")
 
-    def _create_embedding_record(self, memory_id: str, content: str) -> tuple[str, str]:
-        """Insert a pending embedding row and process it, returning (id, status)."""
+    def _create_embedding_record(
+        self, memory_id: str, content: str, precomputed_vector: list[float] | None = None
+    ) -> tuple[str, str]:
+        """Insert a pending embedding row and process it, returning (id, status).
+
+        ``precomputed_vector`` reuses a vector already computed by the dedup
+        gate so remember never embeds the same text twice."""
         embedding_id = f"emb-{uuid.uuid4().hex}"
         checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
         created_at = datetime.now(tz=timezone.utc).isoformat()
@@ -445,8 +473,36 @@ class MemoryService:
             ),
         )
         self.conn.commit()
-        status = self._process_embedding(memory_id, embedding_id, content)
+        status = self._process_embedding(memory_id, embedding_id, content, precomputed_vector)
         return embedding_id, status
+
+    def _find_semantic_duplicate(
+        self, namespace: str, agent_id: str, content: str
+    ) -> tuple[dict[str, Any] | None, list[float] | None]:
+        """Return (duplicate, vector). duplicate is set when a live memory owned
+        by the same agent in this namespace is at least dedup_threshold similar;
+        vector is the query embedding (reused on a miss). Dedup is scoped to
+        (namespace, agent) to match the exact-hash idempotency scope, so
+        distinct agents may hold identical content. Returns (None, None) if
+        embedding fails, so the caller falls back to the retriable path."""
+        try:
+            vector = self.embedding_provider.embed_texts([content])[0]
+        except Exception:
+            LOGGER.warning("dedup embed failed; skipping dedup for namespace=%s", namespace)
+            return None, None
+        for embedding_id, score in self.vector_index.search(vector, 5, namespace):
+            if score < self.config.dedup_threshold:
+                break
+            row = self.conn.execute(
+                """
+                SELECT m.id, m.path FROM embeddings e JOIN memories m ON m.id = e.memory_id
+                WHERE e.embedding_id=? AND m.namespace=? AND m.agent_id=? AND m.deleted_at IS NULL
+                """,
+                (embedding_id, namespace, agent_id),
+            ).fetchone()
+            if row is not None:
+                return {"id": row["id"], "path": row["path"], "score": score}, vector
+        return None, vector
 
     def process_pending_embeddings(self, limit: int = 100) -> dict[str, int]:
         """Retry embeddings left pending/failed (e.g. after a provider outage).
@@ -483,9 +539,19 @@ class MemoryService:
                 return parts[2].strip()
         return text.strip()
 
-    def _process_embedding(self, memory_id: str, embedding_id: str, content: str) -> str:
+    def _process_embedding(
+        self,
+        memory_id: str,
+        embedding_id: str,
+        content: str,
+        precomputed_vector: list[float] | None = None,
+    ) -> str:
         try:
-            vector = self.embedding_provider.embed_texts([content])[0]
+            vector = (
+                precomputed_vector
+                if precomputed_vector is not None
+                else self.embedding_provider.embed_texts([content])[0]
+            )
         except Exception as exc:
             self.conn.execute(
                 "UPDATE embeddings SET status='failed', error=? WHERE embedding_id=?",
@@ -494,13 +560,22 @@ class MemoryService:
             self.conn.commit()
             LOGGER.exception("Embedding generation failed for memory_id=%s", memory_id)
             return "failed"
-        self.vector_index.upsert(embedding_id, vector)
+        namespace = self._namespace_for_memory(memory_id)
+        self.vector_index.upsert(embedding_id, vector, namespace)
         self.conn.execute(
             "UPDATE embeddings SET status='completed', dim=?, error=NULL WHERE embedding_id=?",
             (len(vector), embedding_id),
         )
         self.conn.commit()
         return "completed"
+
+    def _namespace_for_memory(self, memory_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT namespace FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"memory not found for embedding upsert: {memory_id}")
+        return row["namespace"]
 
     def _tags_for_memories(self, memory_ids: list[str]) -> dict[str, set[str]]:
         if not memory_ids:
@@ -590,8 +665,11 @@ class MemoryService:
         self.conn.execute("DELETE FROM memory_tags")
         self.conn.execute("DELETE FROM memory_links")
         self.conn.execute("DELETE FROM embedding_vectors")
+        self.conn.execute("DELETE FROM embedding_labels")
         self.conn.execute("DELETE FROM embeddings")
         self.conn.execute("DELETE FROM memories")
+        # Drop derived ANN caches/sidecars; they get rebuilt from fresh vectors.
+        self.vector_index.reset()
         rebuilt = 0
         for note_path in self.config.vault_root.rglob("*.md"):
             record = self._parse_note(note_path)

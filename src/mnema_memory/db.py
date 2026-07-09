@@ -60,7 +60,22 @@ def bootstrap(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS embedding_vectors (
             embedding_id TEXT PRIMARY KEY,
-            vector_json TEXT NOT NULL,
+            namespace TEXT NOT NULL DEFAULT '',
+            dim INTEGER NOT NULL DEFAULT 0,
+            vector BLOB,
+            vector_json TEXT,
+            FOREIGN KEY(embedding_id) REFERENCES embeddings(embedding_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_embedding_vectors_namespace
+            ON embedding_vectors(namespace);
+
+        -- Stable integer labels for ANN backends (hnswlib requires int ids).
+        CREATE TABLE IF NOT EXISTS embedding_labels (
+            embedding_id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            label INTEGER NOT NULL,
+            UNIQUE(namespace, label),
             FOREIGN KEY(embedding_id) REFERENCES embeddings(embedding_id)
         );
 
@@ -91,4 +106,28 @@ def bootstrap(conn: sqlite3.Connection) -> None:
             WHERE deleted_at IS NULL;
         """
     )
+    _migrate_embedding_vectors(conn)
     conn.commit()
+
+
+def _migrate_embedding_vectors(conn: sqlite3.Connection) -> None:
+    """Add v2 columns to a pre-existing embedding_vectors table.
+
+    Older databases created the table with only (embedding_id, vector_json).
+    CREATE TABLE IF NOT EXISTS never alters an existing table, so backfill the
+    namespace/dim/vector columns here. Legacy vector_json rows are left in
+    place; rebuild_index_from_vault repopulates the BLOB columns.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(embedding_vectors)")}
+    if not columns:
+        return
+    if "namespace" not in columns:
+        conn.execute("ALTER TABLE embedding_vectors ADD COLUMN namespace TEXT NOT NULL DEFAULT ''")
+    if "dim" not in columns:
+        conn.execute("ALTER TABLE embedding_vectors ADD COLUMN dim INTEGER NOT NULL DEFAULT 0")
+    if "vector" not in columns:
+        conn.execute("ALTER TABLE embedding_vectors ADD COLUMN vector BLOB")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_embedding_vectors_namespace "
+        "ON embedding_vectors(namespace)"
+    )

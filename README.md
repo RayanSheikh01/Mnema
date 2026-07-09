@@ -53,6 +53,36 @@ Use `mnema-memory-mcp` only if the package is installed on PATH; otherwise set
 `"command": "python"` with `"args": ["-m", "mnema_memory.server"]` and a `PYTHONPATH`
 entry in `env`. Set `MNEMA_EMBEDDING_PROVIDER=local-hash` to run without an API key.
 
+## Vector search backends
+
+Recall is powered by a pluggable vector index, selected with
+`MNEMA_VECTOR_BACKEND` (or `vector_backend` in TOML):
+
+- `numpy` (default) — exact cosine over float32 vectors, vectorized per
+  namespace. No extra native deps; scales comfortably to ~100k memories per
+  namespace.
+- `hnsw` — approximate nearest-neighbour via hnswlib, one HNSW graph per
+  namespace, persisted as sidecar files beside the SQLite DB and rebuilt from
+  stored vectors on a cold start. Sub-linear; for large namespaces. Requires
+  the `[ann]` extra:
+
+```powershell
+pip install -e .[ann]
+$env:MNEMA_VECTOR_BACKEND = "hnsw"
+```
+
+Both backends partition search by namespace, so a small namespace never scans
+the global index. Tunables (hnsw): `MNEMA_HNSW_M`, `MNEMA_HNSW_EF_CONSTRUCTION`,
+`MNEMA_HNSW_EF`.
+
+## Deduplication
+
+`remember` collapses near-duplicates: after the exact content-hash check, it
+compares the new memory's embedding against the same agent's existing memories
+in the namespace and, above `MNEMA_DEDUP_THRESHOLD` (default `0.95`), returns
+the existing memory with `embedding_status="duplicate"` instead of writing a
+new note. Disable with `MNEMA_DEDUP_ENABLED=false`.
+
 ## Test
 
 ```powershell
@@ -62,7 +92,21 @@ pytest
 
 ## Performance baseline
 
+Benchmarks ingest + average recall latency across namespaces for each
+available backend. Optional args: total memories, namespace count.
+
 ```powershell
 $env:PYTHONPATH = "src"
-python scripts/perf_baseline.py
+python scripts/perf_baseline.py 4000 4
 ```
+
+Sample run (4000 memories, 4 namespaces, ~1000 each, local-hash provider):
+
+```text
+backend=numpy  ingest_4000_s=65.06 recall_avg_ms=14.58
+backend=hnsw   ingest_4000_s=103.18 recall_avg_ms=9.01
+```
+
+`hnsw` trades higher ingest cost (graph construction) for lower, flatter recall
+latency as namespaces grow; `numpy` recall stays exact and cheap up to ~100k
+per namespace. Numbers vary by machine.
