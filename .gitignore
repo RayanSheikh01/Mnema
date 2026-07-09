@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 dist/
 build/
+*.egg-info/
 *.db
 plan.md
 implementation-plan.md
