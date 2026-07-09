@@ -121,31 +121,15 @@ class MemoryService:
                 memory_input.importance,
             ),
         )
-        embedding_id = f"emb-{uuid.uuid4().hex}"
-        checksum = hashlib.sha256(memory_input.content.encode("utf-8")).hexdigest()
-        created_at = datetime.now(tz=timezone.utc).isoformat()
-        self.conn.execute(
-            """
-            INSERT INTO embeddings (embedding_id, memory_id, provider, model, dim, checksum, created_at, status, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL)
-            """,
-            (
-                embedding_id,
-                memory_id,
-                self.config.embedding_provider,
-                self.config.embedding_model,
-                0,
-                checksum,
-                created_at,
-            ),
-        )
         for tag in sorted(set(memory_input.tags)):
             self.conn.execute(
                 "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                 (memory_id, tag),
             )
         self.conn.commit()
-        embedding_status = self._process_embedding(memory_id, embedding_id, memory_input.content)
+        embedding_id, embedding_status = self._create_embedding_record(
+            memory_id, memory_input.content
+        )
         LOGGER.info(
             "remember completed request_id=%s memory_id=%s status=%s",
             request_id,
@@ -396,6 +380,65 @@ class MemoryService:
         if ".." in namespace:
             raise ValueError("namespace contains invalid traversal sequence")
 
+    def _create_embedding_record(self, memory_id: str, content: str) -> tuple[str, str]:
+        """Insert a pending embedding row and process it, returning (id, status)."""
+        embedding_id = f"emb-{uuid.uuid4().hex}"
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        created_at = datetime.now(tz=timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO embeddings (embedding_id, memory_id, provider, model, dim, checksum, created_at, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL)
+            """,
+            (
+                embedding_id,
+                memory_id,
+                self.config.embedding_provider,
+                self.config.embedding_model,
+                0,
+                checksum,
+                created_at,
+            ),
+        )
+        self.conn.commit()
+        status = self._process_embedding(memory_id, embedding_id, content)
+        return embedding_id, status
+
+    def process_pending_embeddings(self, limit: int = 100) -> dict[str, int]:
+        """Retry embeddings left pending/failed (e.g. after a provider outage).
+
+        Reads note content from the vault and re-embeds, so a transient
+        provider failure never permanently loses a memory's recall vector.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT e.embedding_id, e.memory_id, m.path
+            FROM embeddings e JOIN memories m ON m.id = e.memory_id
+            WHERE e.status != 'completed' AND m.deleted_at IS NULL
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        recovered = 0
+        failed = 0
+        for row in rows:
+            content = self._note_body(Path(row["path"]))
+            status = self._process_embedding(row["memory_id"], row["embedding_id"], content)
+            if status == "completed":
+                recovered += 1
+            else:
+                failed += 1
+        LOGGER.info("embedding drain recovered=%s failed=%s", recovered, failed)
+        return {"recovered": recovered, "failed": failed}
+
+    def _note_body(self, note_path: Path) -> str:
+        text = note_path.read_text(encoding="utf-8")
+        if text.startswith("---\n"):
+            parts = text.split("---\n", 2)
+            if len(parts) >= 3:
+                return parts[2].strip()
+        return text.strip()
+
     def _process_embedding(self, memory_id: str, embedding_id: str, content: str) -> str:
         try:
             vector = self.embedding_provider.embed_texts([content])[0]
@@ -512,6 +555,8 @@ class MemoryService:
                     "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                     (record["memory_id"], str(tag)),
                 )
+            # Regenerate embeddings + vectors so recall works after a rebuild.
+            self._create_embedding_record(record["memory_id"], record["content"])
         self.conn.commit()
         return {"rebuilt_memories": rebuilt}
 
