@@ -75,11 +75,16 @@ def test_vault_notes_are_dataview_and_graph_ready() -> None:
         assert frontmatter["tags"].startswith("[") and frontmatter["tags"].endswith("]")
         float(frontmatter["importance"])  # importance must be a real number
 
-    # Link produced reciprocal backlinks in both episodes' frontmatter.
+    # Link produced reciprocal backlinks in both episodes' frontmatter,
+    # stored as [[id]] wikilinks so Obsidian's graph draws edges.
     fa, _ = parse_frontmatter(Path(_path_of(svc, a["memory_id"])))
     fb, _ = parse_frontmatter(Path(_path_of(svc, b["memory_id"])))
-    assert b["memory_id"] in fa["links"]
-    assert a["memory_id"] in fb["links"]
+    assert f"[[{b['memory_id']}]]" in fa["links"]
+    assert f"[[{a['memory_id']}]]" in fb["links"]
+
+    # Every note aliases its own memory_id so [[memory_id]] wikilinks resolve.
+    assert a["memory_id"] in fa["aliases"]
+    assert b["memory_id"] in fb["aliases"]
 
     # Summary is a first-class note that links its sources via graph wikilinks.
     summary_fm, summary_body = parse_frontmatter(Path(_path_of(svc, summary["memory_id"])))

@@ -6,6 +6,9 @@ dist/
 build/
 *.egg-info/
 *.db
+*.db-wal
+*.db-shm
 .env
+vault/
 plan.md
 implementation-plan.md

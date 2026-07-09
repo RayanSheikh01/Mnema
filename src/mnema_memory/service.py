@@ -61,6 +61,9 @@ class MemoryService:
             "type": memory_input.memory_type,
             "memory_id": memory_id,
             "title": title,
+            # Alias to the memory_id so Obsidian resolves [[memory_id]] wikilinks
+            # (filenames carry a timestamp/slug prefix and won't match on their own).
+            "aliases": [memory_id],
             "agent_id": memory_input.agent_id,
             "namespace": memory_input.namespace,
             "session_id": memory_input.session_id,
@@ -69,7 +72,8 @@ class MemoryService:
             "tags": sorted(set(memory_input.tags)),
             "importance": memory_input.importance,
             "embedding_id": None,
-            "links": [str(item) for item in payload.get("links", [])],
+            # Store as [[memory_id]] wikilinks so Obsidian's graph draws edges.
+            "links": [f"[[{item}]]" for item in payload.get("links", [])],
         }
         extra_frontmatter = payload.get("extra_frontmatter", {})
         if not isinstance(extra_frontmatter, dict):
@@ -538,17 +542,23 @@ class MemoryService:
                 link_line_index = idx
                 break
         if link_line_index is None:
-            lines.insert(end_index, f'links: ["{linked_memory_id}"]')
+            lines.insert(end_index, f'links: ["[[{linked_memory_id}]]"]')
         else:
             current = lines[link_line_index].split(":", 1)[1].strip()
-            existing = []
+            existing: list[str] = []
             if current.startswith("[") and current.endswith("]"):
                 raw_values = current[1:-1].strip()
                 if raw_values:
-                    existing = [item.strip().strip('"') for item in raw_values.split(",")]
+                    for item in raw_values.split(","):
+                        # Normalize to the bare id whether stored as "id" or "[[id]]".
+                        inner = item.strip().strip('"')
+                        if inner.startswith("[[") and inner.endswith("]]"):
+                            inner = inner[2:-2]
+                        existing.append(inner)
             if linked_memory_id not in existing:
                 existing.append(linked_memory_id)
-            serialized = ", ".join(f'"{item}"' for item in existing)
+            # Re-serialize as [[id]] wikilinks so Obsidian's graph draws edges.
+            serialized = ", ".join(f'"[[{item}]]"' for item in existing)
             lines[link_line_index] = f"links: [{serialized}]"
         write_atomic(note_path, "\n".join(lines) + "\n")
 
