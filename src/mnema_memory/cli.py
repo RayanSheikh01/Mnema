@@ -26,6 +26,11 @@ def main() -> None:
         action="store_true",
         help="Rebuild SQLite index from vault markdown notes",
     )
+    parser.add_argument(
+        "--drain-embeddings",
+        action="store_true",
+        help="Retry pending/failed embeddings (e.g. after a provider outage)",
+    )
     args = parser.parse_args()
 
     service = MemoryService(AppConfig.load(args.config))
@@ -35,6 +40,9 @@ def main() -> None:
     elif args.rebuild_index:
         result = service.rebuild_index_from_vault()
         print("rebuild completed:", result["rebuilt_memories"])
+    elif args.drain_embeddings:
+        result = service.process_pending_embeddings()
+        print("embedding drain:", f"recovered={result['recovered']} failed={result['failed']}")
     else:
         print("mnema-memory server initialized")
         print("registered tools:", ", ".join(service.router.tool_names))

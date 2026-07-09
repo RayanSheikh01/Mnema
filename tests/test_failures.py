@@ -7,7 +7,7 @@ import pytest
 
 from mnema_memory import fileio
 from mnema_memory.config import AppConfig
-from mnema_memory.embeddings import EmbeddingProvider
+from mnema_memory.embeddings import EmbeddingProvider, HashEmbeddingProvider
 from mnema_memory.service import MemoryService
 
 
@@ -61,6 +61,36 @@ def test_recall_provider_failure_raises_not_empty() -> None:
             "memory.recall",
             {"namespace": "org/proj/dev", "agent_id": "agent-x", "query": "target"},
         )
+    svc.close()
+
+
+def test_pending_embeddings_recovered_after_outage() -> None:
+    # A transient provider outage leaves the embedding 'failed'; once the
+    # provider recovers, the retry drain must re-embed and make it recallable.
+    svc = build_service()
+    svc.embedding_provider = FailingProvider()
+    created = svc.router.call(
+        "memory.remember",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "content": "delta epsilon"},
+    )
+    assert created["embedding_status"] == "failed"
+
+    # Provider recovers; before draining, the memory has no vector so recall misses it.
+    svc.embedding_provider = HashEmbeddingProvider()
+    assert svc.router.call(
+        "memory.recall",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "query": "delta epsilon"},
+    )["items"] == []
+
+    drained = svc.process_pending_embeddings()
+    assert drained["recovered"] == 1
+    assert drained["failed"] == 0
+
+    recalled = svc.router.call(
+        "memory.recall",
+        {"namespace": "org/proj/dev", "agent_id": "agent-x", "query": "delta epsilon"},
+    )
+    assert len(recalled["items"]) == 1
     svc.close()
 
 

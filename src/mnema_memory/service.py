@@ -404,6 +404,41 @@ class MemoryService:
         status = self._process_embedding(memory_id, embedding_id, content)
         return embedding_id, status
 
+    def process_pending_embeddings(self, limit: int = 100) -> dict[str, int]:
+        """Retry embeddings left pending/failed (e.g. after a provider outage).
+
+        Reads note content from the vault and re-embeds, so a transient
+        provider failure never permanently loses a memory's recall vector.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT e.embedding_id, e.memory_id, m.path
+            FROM embeddings e JOIN memories m ON m.id = e.memory_id
+            WHERE e.status != 'completed' AND m.deleted_at IS NULL
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        recovered = 0
+        failed = 0
+        for row in rows:
+            content = self._note_body(Path(row["path"]))
+            status = self._process_embedding(row["memory_id"], row["embedding_id"], content)
+            if status == "completed":
+                recovered += 1
+            else:
+                failed += 1
+        LOGGER.info("embedding drain recovered=%s failed=%s", recovered, failed)
+        return {"recovered": recovered, "failed": failed}
+
+    def _note_body(self, note_path: Path) -> str:
+        text = note_path.read_text(encoding="utf-8")
+        if text.startswith("---\n"):
+            parts = text.split("---\n", 2)
+            if len(parts) >= 3:
+                return parts[2].strip()
+        return text.strip()
+
     def _process_embedding(self, memory_id: str, embedding_id: str, content: str) -> str:
         try:
             vector = self.embedding_provider.embed_texts([content])[0]
