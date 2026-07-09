@@ -601,8 +601,11 @@ class MemoryService:
         self.conn.execute("DELETE FROM memory_tags")
         self.conn.execute("DELETE FROM memory_links")
         self.conn.execute("DELETE FROM embedding_vectors")
+        self.conn.execute("DELETE FROM embedding_labels")
         self.conn.execute("DELETE FROM embeddings")
         self.conn.execute("DELETE FROM memories")
+        # Drop derived ANN caches/sidecars; they get rebuilt from fresh vectors.
+        self.vector_index.reset()
         rebuilt = 0
         for note_path in self.config.vault_root.rglob("*.md"):
             record = self._parse_note(note_path)

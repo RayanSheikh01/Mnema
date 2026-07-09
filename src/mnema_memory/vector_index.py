@@ -17,6 +17,10 @@ class VectorIndex(ABC):
     ) -> list[tuple[str, float]]:
         raise NotImplementedError
 
+    def reset(self) -> None:
+        """Drop any derived in-memory/on-disk state. Durable BLOBs are the
+        source of truth; called after a full index rebuild."""
+
 
 def _as_float32(vector: list[float]) -> np.ndarray:
     return np.asarray(vector, dtype=np.float32)
@@ -26,6 +30,38 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return matrix / norms
+
+
+def guard_dim(conn: sqlite3.Connection, namespace: str, dim: int) -> None:
+    """Raise if ``dim`` disagrees with vectors already stored for ``namespace``."""
+    row = conn.execute(
+        "SELECT dim FROM embedding_vectors WHERE namespace=? AND vector IS NOT NULL LIMIT 1",
+        (namespace,),
+    ).fetchone()
+    if row is not None and row["dim"] != dim:
+        raise ValueError(
+            f"embedding dim {dim} does not match existing dim {row['dim']} "
+            f"for namespace '{namespace}'"
+        )
+
+
+def persist_vector(
+    conn: sqlite3.Connection, embedding_id: str, vector: list[float], namespace: str
+) -> None:
+    """Write a vector as a float32 BLOB — the durable source of truth for every
+    backend. ANN graphs are rebuildable caches derived from these rows."""
+    guard_dim(conn, namespace, len(vector))
+    blob = _as_float32(vector).tobytes()
+    conn.execute(
+        """
+        INSERT INTO embedding_vectors (embedding_id, namespace, dim, vector)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(embedding_id) DO UPDATE SET
+            namespace=excluded.namespace, dim=excluded.dim, vector=excluded.vector
+        """,
+        (embedding_id, namespace, len(vector), blob),
+    )
+    conn.commit()
 
 
 class NumpyVectorIndex(VectorIndex):
@@ -42,19 +78,11 @@ class NumpyVectorIndex(VectorIndex):
         self._cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
 
     def upsert(self, embedding_id: str, vector: list[float], namespace: str) -> None:
-        self._guard_dim(namespace, len(vector))
-        blob = _as_float32(vector).tobytes()
-        self.conn.execute(
-            """
-            INSERT INTO embedding_vectors (embedding_id, namespace, dim, vector)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(embedding_id) DO UPDATE SET
-                namespace=excluded.namespace, dim=excluded.dim, vector=excluded.vector
-            """,
-            (embedding_id, namespace, len(vector), blob),
-        )
-        self.conn.commit()
+        persist_vector(self.conn, embedding_id, vector, namespace)
         self._cache.pop(namespace, None)
+
+    def reset(self) -> None:
+        self._cache.clear()
 
     def search(
         self, query_vector: list[float], top_k: int, namespace: str
@@ -99,18 +127,6 @@ class NumpyVectorIndex(VectorIndex):
             matrix = _normalize_rows(matrix)
         self._cache[namespace] = (count, ids, matrix)
         return ids, matrix
-
-    def _guard_dim(self, namespace: str, dim: int) -> None:
-        row = self.conn.execute(
-            "SELECT dim FROM embedding_vectors "
-            "WHERE namespace=? AND vector IS NOT NULL LIMIT 1",
-            (namespace,),
-        ).fetchone()
-        if row is not None and row["dim"] != dim:
-            raise ValueError(
-                f"embedding dim {dim} does not match existing dim {row['dim']} "
-                f"for namespace '{namespace}'"
-            )
 
 
 def build_vector_index(backend: str, conn: sqlite3.Connection, config=None) -> VectorIndex:
