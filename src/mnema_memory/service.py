@@ -209,6 +209,8 @@ class MemoryService:
             query_sql += " AND m.agent_id = ?"
             params.append(str(agent_id))
         rows = self.conn.execute(query_sql, params).fetchall()
+        query_tags = {str(tag) for tag in payload.get("tags", [])}
+        tags_by_memory = self._tags_for_memories([row["id"] for row in rows])
         results: list[dict[str, Any]] = []
         now = datetime.now(tz=timezone.utc)
         for row in rows:
@@ -216,7 +218,16 @@ class MemoryService:
             age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
             recency_score = 1.0 / (1.0 + age_days)
             vector_score = score_by_embedding.get(row["embedding_id"], 0.0)
-            final_score = (0.7 * vector_score) + (0.2 * recency_score) + (0.1 * row["importance"])
+            tag_score = 0.0
+            if query_tags:
+                overlap = query_tags & tags_by_memory.get(row["id"], set())
+                tag_score = len(overlap) / len(query_tags)
+            final_score = (
+                (0.6 * vector_score)
+                + (0.2 * recency_score)
+                + (0.1 * row["importance"])
+                + (0.1 * tag_score)
+            )
             excerpt = self._read_excerpt(Path(row["path"]))
             results.append(
                 {
@@ -457,6 +468,19 @@ class MemoryService:
         )
         self.conn.commit()
         return "completed"
+
+    def _tags_for_memories(self, memory_ids: list[str]) -> dict[str, set[str]]:
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self.conn.execute(
+            f"SELECT memory_id, tag FROM memory_tags WHERE memory_id IN ({placeholders})",
+            memory_ids,
+        ).fetchall()
+        tags: dict[str, set[str]] = {}
+        for row in rows:
+            tags.setdefault(row["memory_id"], set()).add(row["tag"])
+        return tags
 
     def _read_excerpt(self, note_path: Path, max_chars: int = 240) -> str:
         text = note_path.read_text(encoding="utf-8")

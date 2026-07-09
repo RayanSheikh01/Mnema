@@ -69,6 +69,42 @@ def test_namespace_traversal_rejected() -> None:
     svc.close()
 
 
+def test_recall_tag_match_boosts_ranking() -> None:
+    # Identical content + timestamp + importance => equal vector/recency/importance
+    # scores, so an exact tag match must break the tie and rank first.
+    svc = build_service()
+    ts = "2026-01-01T00:00:00+00:00"
+    svc.router.call(
+        "memory.remember",
+        {
+            "namespace": "org/proj/dev",
+            "agent_id": "tagged",
+            "content": "shared content",
+            "tags": ["travel"],
+            "importance": 0.5,
+            "timestamp": ts,
+        },
+    )
+    svc.router.call(
+        "memory.remember",
+        {
+            "namespace": "org/proj/dev",
+            "agent_id": "untagged",
+            "content": "shared content",
+            "tags": ["other"],
+            "importance": 0.5,
+            "timestamp": ts,
+        },
+    )
+    recalled = svc.router.call(
+        "memory.recall",
+        {"namespace": "org/proj/dev", "query": "shared content", "tags": ["travel"], "top_k": 2},
+    )
+    assert recalled["items"][0]["agent_id"] == "tagged"
+    assert recalled["items"][0]["score"] > recalled["items"][1]["score"]
+    svc.close()
+
+
 def test_recall_importance_breaks_ties() -> None:
     # Identical content + identical timestamp => identical vector and recency scores,
     # so the higher-importance memory must rank first via the importance boost.
