@@ -6,6 +6,27 @@ import os
 import tomllib
 
 
+def load_dotenv(dotenv_path: Path | None = None) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ.
+
+    Zero-dependency. Already-set environment variables win over the file, so an
+    exported OPENAI_API_KEY still overrides the .env value. Lines that are blank
+    or start with '#' are skipped; surrounding quotes on the value are stripped.
+    """
+    path = dotenv_path or (Path.cwd() / ".env")
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 @dataclass(frozen=True)
 class AppConfig:
     vault_root: Path
@@ -17,6 +38,7 @@ class AppConfig:
 
     @staticmethod
     def load(config_path: Path | None = None) -> "AppConfig":
+        load_dotenv()
         file_data: dict[str, str] = {}
         if config_path is not None:
             with config_path.open("rb") as handle:

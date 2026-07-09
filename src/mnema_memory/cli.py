@@ -31,9 +31,20 @@ def main() -> None:
         action="store_true",
         help="Retry pending/failed embeddings (e.g. after a provider outage)",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as an MCP stdio server so external apps can call the memory tools",
+    )
     args = parser.parse_args()
 
     service = MemoryService(AppConfig.load(args.config))
+    if args.serve:
+        from .server import serve_stdio
+
+        serve_stdio(service)
+        service.close()
+        return
     if args.backup_dir is not None:
         result = service.backup_to(args.backup_dir)
         print("backup completed:", result["backup_root"])
