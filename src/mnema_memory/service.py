@@ -104,23 +104,52 @@ class MemoryService:
         lock_path = note_path.with_suffix(note_path.suffix + ".lock")
         with file_lock(lock_path):
             write_atomic(note_path, rendered)
-        self.conn.execute(
-            """
-            INSERT INTO memories (id, namespace, agent_id, type, timestamp, title, path, hash, importance, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                memory_id,
-                memory_input.namespace,
-                memory_input.agent_id,
-                memory_input.memory_type,
-                memory_input.timestamp.isoformat(),
-                title,
-                str(note_path),
-                content_hash,
-                memory_input.importance,
-            ),
-        )
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO memories (id, namespace, agent_id, type, timestamp, title, path, hash, importance, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    memory_id,
+                    memory_input.namespace,
+                    memory_input.agent_id,
+                    memory_input.memory_type,
+                    memory_input.timestamp.isoformat(),
+                    title,
+                    str(note_path),
+                    content_hash,
+                    memory_input.importance,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent writer inserted the same content first. Roll back,
+            # discard our orphan note, and return the winning memory.
+            self.conn.rollback()
+            note_path.unlink(missing_ok=True)
+            winner = self.conn.execute(
+                """
+                SELECT id, path FROM memories
+                WHERE namespace=? AND agent_id=? AND type=? AND hash=? AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                (
+                    memory_input.namespace,
+                    memory_input.agent_id,
+                    memory_input.memory_type,
+                    content_hash,
+                ),
+            ).fetchone()
+            LOGGER.info(
+                "remember idempotent race request_id=%s memory_id=%s",
+                request_id,
+                winner["id"] if winner else None,
+            )
+            return {
+                "memory_id": winner["id"] if winner else memory_id,
+                "file_path": winner["path"] if winner else str(note_path),
+                "embedding_status": "existing",
+            }
         for tag in sorted(set(memory_input.tags)):
             self.conn.execute(
                 "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
@@ -209,6 +238,8 @@ class MemoryService:
             query_sql += " AND m.agent_id = ?"
             params.append(str(agent_id))
         rows = self.conn.execute(query_sql, params).fetchall()
+        query_tags = {str(tag) for tag in payload.get("tags", [])}
+        tags_by_memory = self._tags_for_memories([row["id"] for row in rows])
         results: list[dict[str, Any]] = []
         now = datetime.now(tz=timezone.utc)
         for row in rows:
@@ -216,7 +247,16 @@ class MemoryService:
             age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
             recency_score = 1.0 / (1.0 + age_days)
             vector_score = score_by_embedding.get(row["embedding_id"], 0.0)
-            final_score = (0.7 * vector_score) + (0.2 * recency_score) + (0.1 * row["importance"])
+            tag_score = 0.0
+            if query_tags:
+                overlap = query_tags & tags_by_memory.get(row["id"], set())
+                tag_score = len(overlap) / len(query_tags)
+            final_score = (
+                (0.6 * vector_score)
+                + (0.2 * recency_score)
+                + (0.1 * row["importance"])
+                + (0.1 * tag_score)
+            )
             excerpt = self._read_excerpt(Path(row["path"]))
             results.append(
                 {
@@ -458,6 +498,19 @@ class MemoryService:
         self.conn.commit()
         return "completed"
 
+    def _tags_for_memories(self, memory_ids: list[str]) -> dict[str, set[str]]:
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self.conn.execute(
+            f"SELECT memory_id, tag FROM memory_tags WHERE memory_id IN ({placeholders})",
+            memory_ids,
+        ).fetchall()
+        tags: dict[str, set[str]] = {}
+        for row in rows:
+            tags.setdefault(row["memory_id"], set()).add(row["tag"])
+        return tags
+
     def _read_excerpt(self, note_path: Path, max_chars: int = 240) -> str:
         text = note_path.read_text(encoding="utf-8")
         if "---\n" in text:
@@ -500,6 +553,9 @@ class MemoryService:
         write_atomic(note_path, "\n".join(lines) + "\n")
 
     def backup_to(self, destination_root: Path) -> dict[str, str]:
+        # Fold any WAL contents back into the main db file so the copied
+        # SQLite snapshot is complete.
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup_root = destination_root / f"mnema-backup-{timestamp}"
         vault_backup = backup_root / "vault"

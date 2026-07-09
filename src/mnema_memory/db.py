@@ -6,8 +6,12 @@ import sqlite3
 
 def connect(sqlite_path: Path) -> sqlite3.Connection:
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    # WAL + busy_timeout let multiple agent connections write the same DB
+    # concurrently without "database is locked" errors.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -78,6 +82,13 @@ def bootstrap(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        -- Concurrency-safe idempotency: at most one live memory per
+        -- (namespace, agent, type, content-hash). Enforced at the DB level so
+        -- racing writers cannot both insert the same content.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedupe
+            ON memories(namespace, agent_id, type, hash)
+            WHERE deleted_at IS NULL;
         """
     )
     conn.commit()
