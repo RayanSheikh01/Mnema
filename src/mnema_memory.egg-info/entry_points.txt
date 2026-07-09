@@ -1,0 +1,2 @@
+[console_scripts]
+mnema-memory = mnema_memory.cli:main

@@ -1,0 +1,6 @@
+
+[openai]
+openai>=1.35.0
+
+[test]
+pytest>=8.0.0
