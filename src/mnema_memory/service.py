@@ -106,6 +106,27 @@ class MemoryService:
                 "file_path": existing["path"],
                 "embedding_status": "existing",
             }
+        # Semantic near-duplicate gate: if the content embeds close to an
+        # existing live memory in this namespace, skip the write and return it.
+        # The computed vector is reused for the real embedding record on a miss
+        # so the same text is never embedded twice.
+        precomputed_vector: list[float] | None = None
+        if self.config.dedup_enabled:
+            duplicate, precomputed_vector = self._find_semantic_duplicate(
+                memory_input.namespace, memory_input.agent_id, memory_input.content
+            )
+            if duplicate is not None:
+                LOGGER.info(
+                    "remember dedup hit request_id=%s memory_id=%s score=%.4f",
+                    request_id,
+                    duplicate["id"],
+                    duplicate["score"],
+                )
+                return {
+                    "memory_id": duplicate["id"],
+                    "file_path": duplicate["path"],
+                    "embedding_status": "duplicate",
+                }
         rendered = render_note(frontmatter, memory_input.content)
         lock_path = note_path.with_suffix(note_path.suffix + ".lock")
         with file_lock(lock_path):
@@ -163,7 +184,7 @@ class MemoryService:
             )
         self.conn.commit()
         embedding_id, embedding_status = self._create_embedding_record(
-            memory_id, memory_input.content
+            memory_id, memory_input.content, precomputed_vector
         )
         LOGGER.info(
             "remember completed request_id=%s memory_id=%s status=%s",
@@ -426,8 +447,13 @@ class MemoryService:
         if ".." in namespace:
             raise ValueError("namespace contains invalid traversal sequence")
 
-    def _create_embedding_record(self, memory_id: str, content: str) -> tuple[str, str]:
-        """Insert a pending embedding row and process it, returning (id, status)."""
+    def _create_embedding_record(
+        self, memory_id: str, content: str, precomputed_vector: list[float] | None = None
+    ) -> tuple[str, str]:
+        """Insert a pending embedding row and process it, returning (id, status).
+
+        ``precomputed_vector`` reuses a vector already computed by the dedup
+        gate so remember never embeds the same text twice."""
         embedding_id = f"emb-{uuid.uuid4().hex}"
         checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
         created_at = datetime.now(tz=timezone.utc).isoformat()
@@ -447,8 +473,36 @@ class MemoryService:
             ),
         )
         self.conn.commit()
-        status = self._process_embedding(memory_id, embedding_id, content)
+        status = self._process_embedding(memory_id, embedding_id, content, precomputed_vector)
         return embedding_id, status
+
+    def _find_semantic_duplicate(
+        self, namespace: str, agent_id: str, content: str
+    ) -> tuple[dict[str, Any] | None, list[float] | None]:
+        """Return (duplicate, vector). duplicate is set when a live memory owned
+        by the same agent in this namespace is at least dedup_threshold similar;
+        vector is the query embedding (reused on a miss). Dedup is scoped to
+        (namespace, agent) to match the exact-hash idempotency scope, so
+        distinct agents may hold identical content. Returns (None, None) if
+        embedding fails, so the caller falls back to the retriable path."""
+        try:
+            vector = self.embedding_provider.embed_texts([content])[0]
+        except Exception:
+            LOGGER.warning("dedup embed failed; skipping dedup for namespace=%s", namespace)
+            return None, None
+        for embedding_id, score in self.vector_index.search(vector, 5, namespace):
+            if score < self.config.dedup_threshold:
+                break
+            row = self.conn.execute(
+                """
+                SELECT m.id, m.path FROM embeddings e JOIN memories m ON m.id = e.memory_id
+                WHERE e.embedding_id=? AND m.namespace=? AND m.agent_id=? AND m.deleted_at IS NULL
+                """,
+                (embedding_id, namespace, agent_id),
+            ).fetchone()
+            if row is not None:
+                return {"id": row["id"], "path": row["path"], "score": score}, vector
+        return None, vector
 
     def process_pending_embeddings(self, limit: int = 100) -> dict[str, int]:
         """Retry embeddings left pending/failed (e.g. after a provider outage).
@@ -485,9 +539,19 @@ class MemoryService:
                 return parts[2].strip()
         return text.strip()
 
-    def _process_embedding(self, memory_id: str, embedding_id: str, content: str) -> str:
+    def _process_embedding(
+        self,
+        memory_id: str,
+        embedding_id: str,
+        content: str,
+        precomputed_vector: list[float] | None = None,
+    ) -> str:
         try:
-            vector = self.embedding_provider.embed_texts([content])[0]
+            vector = (
+                precomputed_vector
+                if precomputed_vector is not None
+                else self.embedding_provider.embed_texts([content])[0]
+            )
         except Exception as exc:
             self.conn.execute(
                 "UPDATE embeddings SET status='failed', error=? WHERE embedding_id=?",
