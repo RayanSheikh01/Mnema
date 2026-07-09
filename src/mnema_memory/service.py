@@ -67,8 +67,16 @@ class MemoryService:
             "tags": sorted(set(memory_input.tags)),
             "importance": memory_input.importance,
             "embedding_id": None,
-            "links": [],
+            "links": [str(item) for item in payload.get("links", [])],
         }
+        extra_frontmatter = payload.get("extra_frontmatter", {})
+        if not isinstance(extra_frontmatter, dict):
+            raise ValueError("extra_frontmatter must be an object")
+        if "derived_from" in payload:
+            extra_frontmatter["derived_from"] = [str(item) for item in payload["derived_from"]]
+        if "topics" in payload:
+            extra_frontmatter["topics"] = [str(item) for item in payload["topics"]]
+        frontmatter.update(extra_frontmatter)
         rendered = render_note(frontmatter, memory_input.content)
         write_atomic(note_path, rendered)
         content_hash = hashlib.sha256(memory_input.content.encode("utf-8")).hexdigest()
@@ -214,13 +222,103 @@ class MemoryService:
         return {"items": results[:top_k]}
 
     def _summarize_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("memory.summarize is not implemented yet")
+        namespace = str(payload.get("namespace", self.config.default_namespace))
+        self._validate_namespace(namespace)
+        agent_id = str(payload["agent_id"])
+        memory_ids = [str(value) for value in payload.get("memory_ids", [])]
+        if not memory_ids:
+            rows = self.conn.execute(
+                """
+                SELECT id FROM memories
+                WHERE namespace = ? AND agent_id = ? AND type = 'episode' AND deleted_at IS NULL
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (namespace, agent_id, int(payload.get("limit", 10))),
+            ).fetchall()
+            memory_ids = [row["id"] for row in rows]
+        if not memory_ids:
+            raise ValueError("no source memories available for summary")
+        source_rows = self.conn.execute(
+            f"""
+            SELECT id, title, path FROM memories
+            WHERE id IN ({",".join("?" for _ in memory_ids)}) AND namespace = ? AND agent_id = ? AND deleted_at IS NULL
+            """,
+            [*memory_ids, namespace, agent_id],
+        ).fetchall()
+        if not source_rows:
+            raise ValueError("no matching memories found for summary")
+        bullets: list[str] = []
+        for row in source_rows:
+            excerpt = self._read_excerpt(Path(row["path"]), max_chars=160)
+            bullets.append(f"- {row['title']}: {excerpt}")
+        topic = str(payload.get("topic", "session-summary"))
+        summary_title = payload.get("title") or f"Summary: {topic}"
+        summary_content = "\n".join(
+            [
+                f"## Summary Topic: {topic}",
+                "",
+                "### Key Points",
+                *bullets,
+                "",
+                "### Derived From",
+                *[f"- [[{row['id']}]]" for row in source_rows],
+            ]
+        )
+        result = self._remember_tool(
+            {
+                "namespace": namespace,
+                "agent_id": agent_id,
+                "content": summary_content,
+                "title": summary_title,
+                "type": "summary",
+                "source": "system",
+                "tags": ["summary", topic],
+                "links": [row["id"] for row in source_rows],
+                "derived_from": [row["id"] for row in source_rows],
+                "topics": [topic],
+                "importance": float(payload.get("importance", 0.7)),
+            }
+        )
+        return result
 
     def _link_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("memory.link is not implemented yet")
+        namespace = str(payload.get("namespace", self.config.default_namespace))
+        self._validate_namespace(namespace)
+        src_id = str(payload["memory_id_a"])
+        dst_id = str(payload["memory_id_b"])
+        relation = str(payload.get("relation", "related_to"))
+        src_row = self.conn.execute(
+            "SELECT path FROM memories WHERE id=? AND namespace=?",
+            (src_id, namespace),
+        ).fetchone()
+        dst_row = self.conn.execute(
+            "SELECT path FROM memories WHERE id=? AND namespace=?",
+            (dst_id, namespace),
+        ).fetchone()
+        if src_row is None or dst_row is None:
+            raise ValueError("both memories must exist in namespace before linking")
+        self.conn.execute(
+            "INSERT INTO memory_links (src_id, dst_id, relation) VALUES (?, ?, ?)",
+            (src_id, dst_id, relation),
+        )
+        self.conn.commit()
+        self._upsert_frontmatter_link(Path(src_row["path"]), dst_id)
+        self._upsert_frontmatter_link(Path(dst_row["path"]), src_id)
+        return {"status": "linked", "memory_id_a": src_id, "memory_id_b": dst_id, "relation": relation}
 
     def _forget_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("memory.forget is not implemented yet")
+        namespace = str(payload.get("namespace", self.config.default_namespace))
+        self._validate_namespace(namespace)
+        memory_id = str(payload["memory_id"])
+        deleted_at = datetime.now(tz=timezone.utc).isoformat()
+        cursor = self.conn.execute(
+            "UPDATE memories SET deleted_at=? WHERE id=? AND namespace=? AND deleted_at IS NULL",
+            (deleted_at, memory_id, namespace),
+        )
+        self.conn.commit()
+        if cursor.rowcount == 0:
+            raise ValueError("memory not found or already forgotten")
+        return {"status": "forgotten", "memory_id": memory_id, "deleted_at": deleted_at}
 
     def close(self) -> None:
         self.conn.close()
@@ -295,3 +393,35 @@ class MemoryService:
         else:
             body = text
         return body[:max_chars]
+
+    def _upsert_frontmatter_link(self, note_path: Path, linked_memory_id: str) -> None:
+        text = note_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if not lines or lines[0] != "---":
+            raise ValueError(f"note missing frontmatter: {note_path}")
+        end_index = None
+        for idx in range(1, len(lines)):
+            if lines[idx] == "---":
+                end_index = idx
+                break
+        if end_index is None:
+            raise ValueError(f"note missing frontmatter closing marker: {note_path}")
+        link_line_index = None
+        for idx in range(1, end_index):
+            if lines[idx].startswith("links:"):
+                link_line_index = idx
+                break
+        if link_line_index is None:
+            lines.insert(end_index, f'links: ["{linked_memory_id}"]')
+        else:
+            current = lines[link_line_index].split(":", 1)[1].strip()
+            existing = []
+            if current.startswith("[") and current.endswith("]"):
+                raw_values = current[1:-1].strip()
+                if raw_values:
+                    existing = [item.strip().strip('"') for item in raw_values.split(",")]
+            if linked_memory_id not in existing:
+                existing.append(linked_memory_id)
+            serialized = ", ".join(f'"{item}"' for item in existing)
+            lines[link_line_index] = f"links: [{serialized}]"
+        write_atomic(note_path, "\n".join(lines) + "\n")
