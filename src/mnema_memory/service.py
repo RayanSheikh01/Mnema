@@ -11,7 +11,7 @@ from typing import Any
 from .config import AppConfig
 from .db import bootstrap, connect
 from .embeddings import EmbeddingProvider, build_embedding_provider
-from .fileio import write_atomic
+from .fileio import file_lock, write_atomic
 from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
 from .renderer import render_note
@@ -44,6 +44,7 @@ class MemoryService:
         self.router.register("memory.forget", self._forget_tool)
 
     def _remember_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(payload.get("request_id", uuid.uuid4().hex))
         memory_input = self._memory_input_from_payload(payload)
         memory_input.validate()
         memory_id = generate_memory_id(memory_input.timestamp)
@@ -59,6 +60,7 @@ class MemoryService:
         frontmatter = {
             "type": memory_input.memory_type,
             "memory_id": memory_id,
+            "title": title,
             "agent_id": memory_input.agent_id,
             "namespace": memory_input.namespace,
             "session_id": memory_input.session_id,
@@ -77,9 +79,31 @@ class MemoryService:
         if "topics" in payload:
             extra_frontmatter["topics"] = [str(item) for item in payload["topics"]]
         frontmatter.update(extra_frontmatter)
-        rendered = render_note(frontmatter, memory_input.content)
-        write_atomic(note_path, rendered)
         content_hash = hashlib.sha256(memory_input.content.encode("utf-8")).hexdigest()
+        existing = self.conn.execute(
+            """
+            SELECT id, path FROM memories
+            WHERE namespace=? AND agent_id=? AND type=? AND hash=? AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            (
+                memory_input.namespace,
+                memory_input.agent_id,
+                memory_input.memory_type,
+                content_hash,
+            ),
+        ).fetchone()
+        if existing is not None:
+            LOGGER.info("remember idempotent hit request_id=%s memory_id=%s", request_id, existing["id"])
+            return {
+                "memory_id": existing["id"],
+                "file_path": existing["path"],
+                "embedding_status": "existing",
+            }
+        rendered = render_note(frontmatter, memory_input.content)
+        lock_path = note_path.with_suffix(note_path.suffix + ".lock")
+        with file_lock(lock_path):
+            write_atomic(note_path, rendered)
         self.conn.execute(
             """
             INSERT INTO memories (id, namespace, agent_id, type, timestamp, title, path, hash, importance, deleted_at)
@@ -122,6 +146,12 @@ class MemoryService:
             )
         self.conn.commit()
         embedding_status = self._process_embedding(memory_id, embedding_id, memory_input.content)
+        LOGGER.info(
+            "remember completed request_id=%s memory_id=%s status=%s",
+            request_id,
+            memory_id,
+            embedding_status,
+        )
         return {
             "memory_id": memory_id,
             "file_path": str(note_path),
@@ -425,3 +455,90 @@ class MemoryService:
             serialized = ", ".join(f'"{item}"' for item in existing)
             lines[link_line_index] = f"links: [{serialized}]"
         write_atomic(note_path, "\n".join(lines) + "\n")
+
+    def backup_to(self, destination_root: Path) -> dict[str, str]:
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_root = destination_root / f"mnema-backup-{timestamp}"
+        vault_backup = backup_root / "vault"
+        db_backup = backup_root / "sqlite"
+        vault_backup.mkdir(parents=True, exist_ok=True)
+        db_backup.mkdir(parents=True, exist_ok=True)
+        for source in self.config.vault_root.rglob("*"):
+            if source.is_file():
+                relative = source.relative_to(self.config.vault_root)
+                target = vault_backup / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+        db_target = db_backup / self.config.sqlite_path.name
+        db_target.write_bytes(self.config.sqlite_path.read_bytes())
+        return {
+            "backup_root": str(backup_root),
+            "vault_backup": str(vault_backup),
+            "sqlite_backup": str(db_target),
+        }
+
+    def rebuild_index_from_vault(self) -> dict[str, int]:
+        self.conn.execute("DELETE FROM memory_tags")
+        self.conn.execute("DELETE FROM memory_links")
+        self.conn.execute("DELETE FROM embedding_vectors")
+        self.conn.execute("DELETE FROM embeddings")
+        self.conn.execute("DELETE FROM memories")
+        rebuilt = 0
+        for note_path in self.config.vault_root.rglob("*.md"):
+            record = self._parse_note(note_path)
+            if record is None:
+                continue
+            rebuilt += 1
+            content_hash = hashlib.sha256(record["content"].encode("utf-8")).hexdigest()
+            self.conn.execute(
+                """
+                INSERT INTO memories (id, namespace, agent_id, type, timestamp, title, path, hash, importance, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    record["memory_id"],
+                    record["namespace"],
+                    record["agent_id"],
+                    record["type"],
+                    record["timestamp"],
+                    record["title"],
+                    str(note_path),
+                    content_hash,
+                    float(record.get("importance", 0.5)),
+                ),
+            )
+            for tag in record.get("tags", []):
+                self.conn.execute(
+                    "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                    (record["memory_id"], str(tag)),
+                )
+        self.conn.commit()
+        return {"rebuilt_memories": rebuilt}
+
+    def _parse_note(self, note_path: Path) -> dict[str, Any] | None:
+        text = note_path.read_text(encoding="utf-8")
+        if not text.startswith("---\n"):
+            return None
+        parts = text.split("---\n", 2)
+        if len(parts) < 3:
+            return None
+        raw_frontmatter = parts[1].splitlines()
+        body = parts[2].strip()
+        parsed: dict[str, Any] = {"content": body}
+        for line in raw_frontmatter:
+            if ":" not in line:
+                continue
+            key, raw_value = line.split(":", 1)
+            value = raw_value.strip().strip('"')
+            if value.startswith("[") and value.endswith("]"):
+                inner = value[1:-1].strip()
+                parsed[key.strip()] = (
+                    [item.strip().strip('"') for item in inner.split(",")] if inner else []
+                )
+            else:
+                parsed[key.strip()] = value
+        required = {"memory_id", "namespace", "agent_id", "type", "timestamp"}
+        if not required.issubset(parsed.keys()):
+            return None
+        parsed["title"] = parsed.get("title") or note_path.stem
+        return parsed
