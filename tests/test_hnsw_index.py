@@ -80,6 +80,29 @@ def test_hnsw_cold_rebuild_from_blobs() -> None:
     assert results[0][0] == "b"
 
 
+def test_hnsw_delete_survives_persistence_and_cold_rebuild() -> None:
+    import shutil
+
+    index, conn, tmp = make_index()
+    index.upsert("a", [1.0, 0.0], "ns/one")
+    index.upsert("b", [0.0, 1.0], "ns/one")
+
+    index.delete("a", "ns/one")
+    assert [e for e, _ in index.search([1.0, 0.0], top_k=2, namespace="ns/one")] == ["b"]
+
+    # Reload from the sidecar: the mark_deleted tombstone must persist.
+    config = SimpleNamespace(
+        sqlite_path=tmp / "mnema.db", hnsw_m=16, hnsw_ef_construction=200, hnsw_ef=64
+    )
+    reopened = HnswVectorIndex(conn, config)
+    assert "a" not in [e for e, _ in reopened.search([1.0, 0.0], top_k=2, namespace="ns/one")]
+
+    # Cold rebuild from BLOBs (sidecar gone) must also exclude it — the BLOB was purged.
+    shutil.rmtree(tmp / "mnema.db.hnsw", ignore_errors=True)
+    rebuilt = HnswVectorIndex(conn, config)
+    assert "a" not in [e for e, _ in rebuilt.search([1.0, 0.0], top_k=2, namespace="ns/one")]
+
+
 def _hnsw_service() -> MemoryService:
     root = Path(tempfile.mkdtemp())
     return MemoryService(

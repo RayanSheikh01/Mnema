@@ -75,6 +75,22 @@ def test_upsert_overwrites_same_id_and_refreshes_cache() -> None:
     assert results[0][1] == pytest.approx(1.0, abs=1e-5)
 
 
+def test_delete_removes_from_search_and_blobs() -> None:
+    index = NumpyVectorIndex(make_conn())
+    for emb_id, vec in {"a": [1.0, 0.0], "b": [0.0, 1.0], "c": [0.9, 0.1]}.items():
+        index.upsert(emb_id, vec, "ns/one")
+    index.search([1.0, 0.0], top_k=3, namespace="ns/one")  # warm cache
+
+    index.delete("a", "ns/one")
+
+    ids = [emb_id for emb_id, _ in index.search([1.0, 0.0], top_k=3, namespace="ns/one")]
+    assert "a" not in ids
+    assert ids == ["c", "b"]  # survivors still ranked
+    # BLOB is gone, so a cold index rebuilt from the same DB also excludes it.
+    cold = NumpyVectorIndex(index.conn)
+    assert "a" not in [e for e, _ in cold.search([1.0, 0.0], top_k=3, namespace="ns/one")]
+
+
 def test_build_vector_index_defaults_to_numpy() -> None:
     index = build_vector_index("numpy", make_conn())
     assert isinstance(index, NumpyVectorIndex)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import logging
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 import hashlib
@@ -58,6 +59,7 @@ class MemoryService:
         self.router.register("memory.summarize", self._summarize_tool)
         self.router.register("memory.link", self._link_tool)
         self.router.register("memory.forget", self._forget_tool)
+        self.router.register("memory.unforget", self._unforget_tool)
 
     def _remember_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = str(payload.get("request_id", uuid.uuid4().hex))
@@ -408,15 +410,55 @@ class MemoryService:
         namespace = str(payload.get("namespace", self.config.default_namespace))
         self._validate_namespace(namespace)
         memory_id = str(payload["memory_id"])
+        row = self.conn.execute(
+            "SELECT path FROM memories WHERE id=? AND namespace=? AND deleted_at IS NULL",
+            (memory_id, namespace),
+        ).fetchone()
+        if row is None:
+            raise ValueError("memory not found or already forgotten")
         deleted_at = datetime.now(tz=timezone.utc).isoformat()
-        cursor = self.conn.execute(
-            "UPDATE memories SET deleted_at=? WHERE id=? AND namespace=? AND deleted_at IS NULL",
+        self.conn.execute(
+            "UPDATE memories SET deleted_at=? WHERE id=? AND namespace=?",
             (deleted_at, memory_id, namespace),
         )
+        # Purge every vector for this memory so recall/dedup never score it again,
+        # then drop the embedding rows so a rebuild starts clean.
+        self._purge_memory_vectors(memory_id, namespace)
         self.conn.commit()
-        if cursor.rowcount == 0:
-            raise ValueError("memory not found or already forgotten")
+        # Tombstone the canonical note so a rebuild-from-vault stays forgotten.
+        self._set_frontmatter_deleted(Path(row["path"]), deleted_at)
         return {"status": "forgotten", "memory_id": memory_id, "deleted_at": deleted_at}
+
+    def _unforget_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        namespace = str(payload.get("namespace", self.config.default_namespace))
+        self._validate_namespace(namespace)
+        memory_id = str(payload["memory_id"])
+        row = self.conn.execute(
+            "SELECT path FROM memories WHERE id=? AND namespace=? AND deleted_at IS NOT NULL",
+            (memory_id, namespace),
+        ).fetchone()
+        if row is None:
+            raise ValueError("memory not found or not forgotten")
+        self.conn.execute(
+            "UPDATE memories SET deleted_at=NULL WHERE id=? AND namespace=?",
+            (memory_id, namespace),
+        )
+        self.conn.commit()
+        # Clear the tombstone and re-embed so the vector returns to recall.
+        self._set_frontmatter_deleted(Path(row["path"]), None)
+        _, status = self._create_embedding_record(memory_id, self._note_body(Path(row["path"])))
+        return {"status": "restored", "memory_id": memory_id, "embedding_status": status}
+
+    def _purge_memory_vectors(self, memory_id: str, namespace: str) -> None:
+        embedding_ids = [
+            r["embedding_id"]
+            for r in self.conn.execute(
+                "SELECT embedding_id FROM embeddings WHERE memory_id=?", (memory_id,)
+            ).fetchall()
+        ]
+        for embedding_id in embedding_ids:
+            self.vector_index.delete(embedding_id, namespace)
+        self.conn.execute("DELETE FROM embeddings WHERE memory_id=?", (memory_id,))
 
     def close(self) -> None:
         self.conn.close()
@@ -630,6 +672,35 @@ class MemoryService:
             return f"[[{memory_id}]]"
         return f"[[{Path(row['path']).stem}|{row['title']}]]"
 
+    def _set_frontmatter_deleted(self, note_path: Path, value: str | None) -> None:
+        """Set (``value`` = iso timestamp) or clear (``value`` = None) a
+        ``deleted_at:`` line in the note frontmatter. This tombstone is what
+        makes a forget survive ``rebuild_index_from_vault``."""
+        text = note_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if not lines or lines[0] != "---":
+            raise ValueError(f"note missing frontmatter: {note_path}")
+        end_index = None
+        for idx in range(1, len(lines)):
+            if lines[idx] == "---":
+                end_index = idx
+                break
+        if end_index is None:
+            raise ValueError(f"note missing frontmatter closing marker: {note_path}")
+        del_index = None
+        for idx in range(1, end_index):
+            if lines[idx].startswith("deleted_at:"):
+                del_index = idx
+                break
+        if value is None:
+            if del_index is not None:
+                del lines[del_index]
+        elif del_index is None:
+            lines.insert(end_index, f"deleted_at: {value}")
+        else:
+            lines[del_index] = f"deleted_at: {value}"
+        write_atomic(note_path, "\n".join(lines) + "\n")
+
     def _upsert_frontmatter_link(self, note_path: Path, linked_memory_id: str) -> None:
         text = note_path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -690,6 +761,43 @@ class MemoryService:
             "sqlite_backup": str(db_target),
         }
 
+    def restore_from(self, backup_root: Path) -> dict[str, str]:
+        """Overwrite the live vault + SQLite with a backup produced by
+        ``backup_to`` — the inverse of backup. Destructive: any memory created
+        after the backup is discarded. ANN sidecars are dropped and rebuilt
+        lazily from the restored BLOBs."""
+        vault_backup = backup_root / "vault"
+        db_backup = backup_root / "sqlite" / self.config.sqlite_path.name
+        if not vault_backup.exists() or not db_backup.exists():
+            raise ValueError(f"not a valid mnema backup: {backup_root}")
+        # Close the live connection so the SQLite file can be overwritten
+        # (Windows locks open files).
+        self.conn.close()
+        # Replace the vault wholesale so post-backup memories are gone.
+        if self.config.vault_root.exists():
+            shutil.rmtree(self.config.vault_root)
+        shutil.copytree(vault_backup, self.config.vault_root)
+        # Clear any stale WAL sidecars before dropping in the restored db.
+        for suffix in ("-wal", "-shm"):
+            stale = Path(str(self.config.sqlite_path) + suffix)
+            stale.unlink(missing_ok=True)
+        self.config.sqlite_path.write_bytes(db_backup.read_bytes())
+        # Drop ANN sidecars; they rebuild lazily from the restored BLOBs.
+        sidecar_dir = Path(str(self.config.sqlite_path) + ".hnsw")
+        if sidecar_dir.exists():
+            shutil.rmtree(sidecar_dir, ignore_errors=True)
+        # Reopen against the restored files.
+        self.conn = connect(self.config.sqlite_path)
+        bootstrap(self.conn)
+        self.vector_index = build_vector_index(
+            self.config.vector_backend, self.conn, self.config
+        )
+        LOGGER.info("restore completed from=%s", backup_root)
+        return {
+            "vault_root": str(self.config.vault_root),
+            "sqlite_path": str(self.config.sqlite_path),
+        }
+
     def rebuild_index_from_vault(self) -> dict[str, int]:
         self.conn.execute("DELETE FROM memory_tags")
         self.conn.execute("DELETE FROM memory_links")
@@ -706,10 +814,11 @@ class MemoryService:
                 continue
             rebuilt += 1
             content_hash = hashlib.sha256(record["content"].encode("utf-8")).hexdigest()
+            deleted_at = record.get("deleted_at") or None
             self.conn.execute(
                 """
                 INSERT INTO memories (id, namespace, agent_id, type, timestamp, title, path, hash, importance, deleted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["memory_id"],
@@ -721,6 +830,7 @@ class MemoryService:
                     str(note_path),
                     content_hash,
                     float(record.get("importance", 0.5)),
+                    deleted_at,
                 ),
             )
             for tag in record.get("tags", []):
@@ -728,8 +838,10 @@ class MemoryService:
                     "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                     (record["memory_id"], str(tag)),
                 )
-            # Regenerate embeddings + vectors so recall works after a rebuild.
-            self._create_embedding_record(record["memory_id"], record["content"])
+            # Regenerate embeddings + vectors so recall works after a rebuild —
+            # but never re-embed a tombstoned note, or forget would not survive.
+            if deleted_at is None:
+                self._create_embedding_record(record["memory_id"], record["content"])
         self.conn.commit()
         return {"rebuilt_memories": rebuilt}
 

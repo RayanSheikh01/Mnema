@@ -28,7 +28,7 @@ mnema-memory --serve
 
 It reads JSON-RPC 2.0 requests on stdin and writes responses to stdout; logs go
 to stderr. Exposed tools: `memory_remember`, `memory_list`, `memory_recall`,
-`memory_summarize`, `memory_link`, `memory_forget`.
+`memory_summarize`, `memory_link`, `memory_forget`, `memory_unforget`.
 
 Register it in an MCP client config (e.g. Claude Desktop
 `claude_desktop_config.json`):
@@ -82,6 +82,27 @@ compares the new memory's embedding against the same agent's existing memories
 in the namespace and, above `MNEMA_DEDUP_THRESHOLD` (default `0.95`), returns
 the existing memory with `embedding_status="duplicate"` instead of writing a
 new note. Disable with `MNEMA_DEDUP_ENABLED=false`.
+
+## Forgetting & recovery
+
+`forget` is a durable soft delete. It sets `deleted_at` on the SQLite row, purges
+the memory's vectors from the active index (numpy cache and hnsw graph, plus the
+float32 BLOBs that back a rebuild), and tombstones the canonical note's
+frontmatter with `deleted_at:`. Because the vault is canonical, the tombstone is
+what makes a forget survive `--rebuild-index`: the forgotten memory is never
+re-embedded and never re-enters recall or the dedup gate. `unforget` reverses it
+— clears the tombstone and re-embeds so the memory returns to recall.
+
+Back up and restore the whole store from the CLI:
+
+```powershell
+mnema-memory --backup-dir C:/backups          # snapshot vault + SQLite
+mnema-memory --restore-dir C:/backups/mnema-backup-<ts>   # destructive overwrite
+```
+
+`--restore-dir` replaces the live vault and database with the snapshot (any
+memory created after the backup is discarded) and drops stale hnsw sidecars,
+which rebuild lazily from the restored vectors.
 
 ## Test
 

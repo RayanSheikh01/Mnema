@@ -22,6 +22,12 @@ def main() -> None:
         help="Create a vault/sqlite backup under this directory",
     )
     parser.add_argument(
+        "--restore-dir",
+        type=Path,
+        default=None,
+        help="Restore vault/sqlite from a backup created by --backup-dir (destructive overwrite)",
+    )
+    parser.add_argument(
         "--rebuild-index",
         action="store_true",
         help="Rebuild SQLite index from vault markdown notes",
@@ -48,6 +54,11 @@ def main() -> None:
     if args.backup_dir is not None:
         result = service.backup_to(args.backup_dir)
         print("backup completed:", result["backup_root"])
+    elif args.restore_dir is not None:
+        result = service.restore_from(args.restore_dir)
+        print("restore completed:")
+        print("  vault replaced:", result["vault_root"])
+        print("  sqlite replaced:", result["sqlite_path"])
     elif args.rebuild_index:
         result = service.rebuild_index_from_vault()
         print("rebuild completed:", result["rebuilt_memories"])

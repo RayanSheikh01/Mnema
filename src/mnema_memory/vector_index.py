@@ -17,6 +17,12 @@ class VectorIndex(ABC):
     ) -> list[tuple[str, float]]:
         raise NotImplementedError
 
+    @abstractmethod
+    def delete(self, embedding_id: str, namespace: str) -> None:
+        """Remove an embedding so it is never scored or returned again. Purges
+        the durable BLOB so a rebuild cannot resurrect it."""
+        raise NotImplementedError
+
     def reset(self) -> None:
         """Drop any derived in-memory/on-disk state. Durable BLOBs are the
         source of truth; called after a full index rebuild."""
@@ -64,6 +70,15 @@ def persist_vector(
     conn.commit()
 
 
+def delete_vector(conn: sqlite3.Connection, embedding_id: str) -> None:
+    """Drop the durable BLOB + label rows for an embedding. The BLOB is the
+    source of truth every backend rebuilds from, so removing it is what makes a
+    forget survive a rebuild."""
+    conn.execute("DELETE FROM embedding_vectors WHERE embedding_id=?", (embedding_id,))
+    conn.execute("DELETE FROM embedding_labels WHERE embedding_id=?", (embedding_id,))
+    conn.commit()
+
+
 class NumpyVectorIndex(VectorIndex):
     """Exact cosine search backed by float32 BLOBs in SQLite.
 
@@ -79,6 +94,10 @@ class NumpyVectorIndex(VectorIndex):
 
     def upsert(self, embedding_id: str, vector: list[float], namespace: str) -> None:
         persist_vector(self.conn, embedding_id, vector, namespace)
+        self._cache.pop(namespace, None)
+
+    def delete(self, embedding_id: str, namespace: str) -> None:
+        delete_vector(self.conn, embedding_id)
         self._cache.pop(namespace, None)
 
     def reset(self) -> None:

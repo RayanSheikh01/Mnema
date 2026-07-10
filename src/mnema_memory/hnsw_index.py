@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .vector_index import VectorIndex, persist_vector
+from .vector_index import VectorIndex, delete_vector, persist_vector
 
 
 class HnswVectorIndex(VectorIndex):
@@ -54,9 +54,13 @@ class HnswVectorIndex(VectorIndex):
         self, query_vector: list[float], top_k: int, namespace: str
     ) -> list[tuple[str, float]]:
         index = self._ensure_index(namespace)
-        if index is None or index.get_current_count() == 0:
+        # Live count comes from the BLOB table, not the graph: mark_deleted
+        # leaves tombstones in get_current_count(), and asking knn_query for more
+        # neighbours than live elements raises "Cannot return ... 2D array".
+        live = self._stored_count(namespace)
+        if index is None or live == 0:
             return []
-        k = min(top_k, index.get_current_count())
+        k = min(top_k, live)
         index.set_ef(max(self.ef, k))
         labels, distances = index.knn_query(
             np.asarray([query_vector], dtype=np.float32), k=k
@@ -70,6 +74,27 @@ class HnswVectorIndex(VectorIndex):
             # hnswlib 'cosine' space returns distance = 1 - cosine_similarity.
             results.append((embedding_id, 1.0 - float(distance)))
         return results
+
+    def delete(self, embedding_id: str, namespace: str) -> None:
+        # Tombstone the element in the live graph so knn_query stops returning
+        # it, and persist the tombstone into the sidecar (hnswlib preserves
+        # mark_deleted across save/load). Purge the BLOB + label rows last so a
+        # cold rebuild from BLOBs also excludes it.
+        row = self.conn.execute(
+            "SELECT label FROM embedding_labels WHERE embedding_id=?",
+            (embedding_id,),
+        ).fetchone()
+        if row is not None:
+            index = self._ensure_index(namespace)
+            if index is not None:
+                try:
+                    index.mark_deleted(int(row["label"]))
+                    self._save(namespace, index)
+                except RuntimeError:
+                    # Label absent from a cold graph or already deleted — the
+                    # BLOB purge below still removes it from any future rebuild.
+                    pass
+        delete_vector(self.conn, embedding_id)
 
     def reset(self) -> None:
         self._indexes.clear()
