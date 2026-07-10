@@ -53,6 +53,51 @@ Use `mnema-memory-mcp` only if the package is installed on PATH; otherwise set
 `"command": "python"` with `"args": ["-m", "mnema_memory.server"]` and a `PYTHONPATH`
 entry in `env`. Set `MNEMA_EMBEDDING_PROVIDER=local-hash` to run without an API key.
 
+## Embedding providers
+
+Recall and deduplication run on a pluggable `EmbeddingProvider`, selected with
+`MNEMA_EMBEDDING_PROVIDER` (or `embedding_provider` in TOML):
+
+- `openai` (default) — real remote semantic embeddings (`text-embedding-3-small`).
+  Needs `OPENAI_API_KEY` and the `[openai]` extra.
+- `local` — real **local** semantic embeddings via `sentence-transformers`. No
+  API key, and memory contents never leave the machine. Aliases:
+  `sentence-transformers`, `sentence_transformers`.
+- `local-hash` — deterministic, dependency-free hash vectors. Fast and offline,
+  but **not semantically meaningful** — use it only for tests/offline smoke runs.
+
+### Local embeddings
+
+```powershell
+pip install -e .[local]
+$env:MNEMA_EMBEDDING_PROVIDER = "local"
+$env:MNEMA_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim, CPU-friendly
+```
+
+The model is downloaded once to the standard Hugging Face cache (override with
+`MNEMA_LOCAL_MODEL_CACHE`; the cache is never written inside the vault). Extra
+knobs: `MNEMA_LOCAL_FILES_ONLY=true` fails fast unless the model is already
+cached (fully offline), `MNEMA_LOCAL_DEVICE` forces a device (CPU by default),
+`MNEMA_LOCAL_BATCH_SIZE` tunes encode batches.
+
+### Switching a namespace's model (migration)
+
+A namespace stores vectors from exactly one model — cosine scores across models
+are meaningless. Mnema records each namespace's `(provider, model, dim)` and
+refuses ordinary `remember`/`recall` when the configured identity disagrees with
+the stored one, naming the exact fix. Migrate a populated namespace with an
+explicit, all-or-nothing re-embed:
+
+```powershell
+mnema-memory --embedding-status                       # configured vs stored identity per namespace
+mnema-memory --reembed --namespace org/project/dev    # re-embed live memories with the configured model
+```
+
+`--reembed` computes and validates every new vector before touching the index,
+so a provider failure leaves the old namespace untouched; forgotten
+(tombstoned) memories are never re-embedded; re-running with an
+already-owned identity reports zero changes.
+
 ## Vector search backends
 
 Recall is powered by a pluggable vector index, selected with
