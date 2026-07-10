@@ -101,7 +101,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "memory_forget": {
         "router": "memory.forget",
-        "description": "Soft-delete a memory by id.",
+        "description": "Soft-delete a memory by id (purges its vectors; survives a rebuild).",
+        "properties": {
+            "memory_id": _STRING,
+            "namespace": _STRING,
+        },
+        "required": ["memory_id"],
+    },
+    "memory_unforget": {
+        "router": "memory.unforget",
+        "description": "Reverse a forget: clear the tombstone and re-embed so the memory returns to recall.",
         "properties": {
             "memory_id": _STRING,
             "namespace": _STRING,
@@ -222,6 +231,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,  # keep stdout clean for the JSON-RPC channel
     )
+    # Force UTF-8 on the JSON-RPC channel: on Windows sys.stdin/stdout default
+    # to the locale code page (e.g. cp1252), which mangles multi-byte UTF-8 the
+    # MCP client sends (an em-dash "—" is decoded as "â€”" and persisted to the vault).
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
     config_env = None
     service = MemoryService(AppConfig.load(config_env))
     LOGGER.info("mnema-memory MCP server ready (tools: %s)", ", ".join(TOOLS.keys()))
