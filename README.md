@@ -198,3 +198,29 @@ backend=hnsw   ingest_4000_s=103.18 recall_avg_ms=9.01
 `hnsw` trades higher ingest cost (graph construction) for lower, flatter recall
 latency as namespaces grow; `numpy` recall stays exact and cheap up to ~100k
 per namespace. Numbers vary by machine.
+
+## Ranking
+
+Recall combines vector similarity, recency, caller importance, and requested-tag
+overlap. Its defaults are `0.6`, `0.2`, `0.1`, and `0.1`; change their relative
+influence with `MNEMA_RANK_WEIGHT_VECTOR`, `MNEMA_RANK_WEIGHT_RECENCY`,
+`MNEMA_RANK_WEIGHT_IMPORTANCE`, and `MNEMA_RANK_WEIGHT_TAG`. Recency decays
+exponentially and halves every `MNEMA_RECENCY_HALF_LIFE_DAYS` (default `1.0`).
+
+Set `MNEMA_AUTO_IMPORTANCE=true` to give memories without an explicit
+`importance` a local bounded heuristic based on note length, tags, and whether
+the memory is a summary. An explicit `importance` always takes precedence.
+
+## Retention
+
+Retention is disabled by default and never hard-deletes. Once
+`MNEMA_RETENTION_ENABLED=true`, run a reversible sweep with:
+
+```powershell
+mnema-memory --retention --dry-run
+mnema-memory --retention --namespace org/project/dev
+```
+
+It forgets only live memories at least `MNEMA_RETENTION_MAX_AGE_DAYS` old
+(default `365`) whose importance is below `MNEMA_RETENTION_MIN_IMPORTANCE`
+(default `0.25`). Summaries are exempt unless
