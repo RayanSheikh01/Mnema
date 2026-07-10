@@ -11,7 +11,11 @@ from typing import Any
 
 from .config import AppConfig
 from .db import bootstrap, connect
-from .embeddings import EmbeddingProvider, build_embedding_provider
+from .embeddings import (
+    EmbeddingProvider,
+    build_embedding_provider,
+    canonical_provider_name,
+)
 from .fileio import file_lock, write_atomic
 from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
@@ -44,7 +48,12 @@ class MemoryService:
         self.conn: sqlite3.Connection = connect(config.sqlite_path)
         bootstrap(self.conn)
         self.embedding_provider: EmbeddingProvider = build_embedding_provider(
-            config.embedding_provider, config.embedding_model
+            config.embedding_provider,
+            config.embedding_model,
+            local_model_cache=config.local_model_cache,
+            local_files_only=config.local_files_only,
+            local_device=config.local_device,
+            local_batch_size=config.local_batch_size,
         )
         self.vector_index: VectorIndex = build_vector_index(
             config.vector_backend, self.conn, config
@@ -65,6 +74,7 @@ class MemoryService:
         request_id = str(payload.get("request_id", uuid.uuid4().hex))
         memory_input = self._memory_input_from_payload(payload)
         memory_input.validate()
+        self._assert_namespace_provider(memory_input.namespace)
         memory_id = generate_memory_id(memory_input.timestamp)
         title = memory_input.title or memory_input.content.splitlines()[0][:80]
         slug = slugify(title)
@@ -268,6 +278,7 @@ class MemoryService:
         top_k = int(payload.get("top_k", 10))
         agent_id = payload.get("agent_id")
         query_vector = self.embedding_provider.embed_texts([query])[0]
+        self._assert_namespace_compatible(namespace, len(query_vector))
         candidate_scores = self.vector_index.search(query_vector, top_k * 5, namespace)
         if not candidate_scores:
             return {"items": []}
@@ -459,6 +470,192 @@ class MemoryService:
         for embedding_id in embedding_ids:
             self.vector_index.delete(embedding_id, namespace)
         self.conn.execute("DELETE FROM embeddings WHERE memory_id=?", (memory_id,))
+
+    # ---- embedding identity / migration ----------------------------------
+
+    def _configured_identity(self) -> tuple[str, str]:
+        """The (canonical provider, model) this service is configured to write."""
+        return canonical_provider_name(self.config.embedding_provider), self.config.embedding_model
+
+    def _stored_namespace_identity(self, namespace: str) -> tuple[str, str, int] | None:
+        """The (provider, model, dim) of a namespace's live vectors, or None if
+        the namespace has no live embeddings yet."""
+        row = self.conn.execute(
+            """
+            SELECT ev.dim AS dim, e.provider AS provider, e.model AS model
+            FROM embedding_vectors ev
+            JOIN embeddings e ON e.embedding_id = ev.embedding_id
+            JOIN memories m ON m.id = e.memory_id
+            WHERE ev.namespace = ? AND ev.vector IS NOT NULL AND m.deleted_at IS NULL
+            LIMIT 1
+            """,
+            (namespace,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row["provider"]), str(row["model"]), int(row["dim"]))
+
+    def _identity_error(self, namespace: str, stored: tuple[str, str, int]) -> str:
+        provider, model, dim = stored
+        cfg_provider, cfg_model = self._configured_identity()
+        return (
+            f"embedding identity mismatch for namespace '{namespace}': stored live "
+            f"vectors are provider={provider} model={model} dim={dim}, but this service "
+            f"is configured for provider={cfg_provider} model={cfg_model}. Cosine scores "
+            f"across models are meaningless; run an explicit re-embed to migrate: "
+            f"mnema-memory --reembed --namespace {namespace}"
+        )
+
+    def _assert_namespace_provider(self, namespace: str) -> None:
+        """Reject a write when the namespace's live vectors were made by a
+        different provider/model. Cheap: no dim (no embedding) required."""
+        stored = self._stored_namespace_identity(namespace)
+        if stored is None:
+            return
+        provider, model, _dim = stored
+        cfg_provider, cfg_model = self._configured_identity()
+        if (canonical_provider_name(provider), model) != (cfg_provider, cfg_model):
+            raise ValueError(self._identity_error(namespace, stored))
+
+    def _assert_namespace_compatible(self, namespace: str, dim: int) -> None:
+        """Reject a recall when the query's provider/model/dim disagree with the
+        namespace's live vectors. Uses the actual produced dimension so a
+        misconfigured model is caught even if its name happens to match."""
+        stored = self._stored_namespace_identity(namespace)
+        if stored is None:
+            return
+        provider, model, stored_dim = stored
+        cfg_provider, cfg_model = self._configured_identity()
+        if (canonical_provider_name(provider), model, stored_dim) != (
+            cfg_provider,
+            cfg_model,
+            dim,
+        ):
+            raise ValueError(self._identity_error(namespace, stored))
+
+    def _embed_in_batches(self, texts: list[str], batch_size: int) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), max(batch_size, 1)):
+            vectors.extend(self.embedding_provider.embed_texts(texts[start : start + batch_size]))
+        if len(vectors) != len(texts):
+            raise ValueError("embedding provider returned wrong number of vectors")
+        return vectors
+
+    def _live_without_completed_embedding(self, namespace: str) -> int:
+        return self.conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM memories m
+            WHERE m.namespace = ? AND m.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM embeddings e
+                WHERE e.memory_id = m.id AND e.status = 'completed'
+              )
+            """,
+            (namespace,),
+        ).fetchone()["n"]
+
+    def reembed(self, namespace: str, batch_size: int | None = None) -> dict[str, Any]:
+        """Re-embed every live memory in ``namespace`` with the currently
+        configured provider/model as a single all-or-nothing namespace reindex.
+
+        Vectors are computed and validated *before* any destructive mutation, so
+        a provider failure leaves the old namespace index fully intact. On
+        success the old vectors/labels are purged and replaced with one uniform
+        identity. Tombstoned (forgotten) memories are never touched. Rerunning
+        with an identity the namespace already owns reports zero changes."""
+        self._validate_namespace(namespace)
+        cfg_provider, cfg_model = self._configured_identity()
+        skipped_deleted = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE namespace=? AND deleted_at IS NOT NULL",
+            (namespace,),
+        ).fetchone()["n"]
+        live = self.conn.execute(
+            "SELECT id, path FROM memories WHERE namespace=? AND deleted_at IS NULL ORDER BY timestamp",
+            (namespace,),
+        ).fetchall()
+        base = {
+            "namespace": namespace,
+            "scanned": len(live),
+            "skipped_deleted": skipped_deleted,
+            "provider": cfg_provider,
+            "model": cfg_model,
+        }
+        if not live:
+            return {**base, "reembedded": 0, "failed": 0, "dim": 0, "changed": False}
+        contents = [(row["id"], self._note_body(Path(row["path"]))) for row in live]
+        bs = batch_size or self.config.local_batch_size
+        # Prepare + validate ALL vectors before mutating anything (atomicity).
+        try:
+            vectors = self._embed_in_batches([content for _, content in contents], bs)
+        except Exception as exc:
+            LOGGER.exception("reembed preparation failed namespace=%s", namespace)
+            return {
+                **base,
+                "reembedded": 0,
+                "failed": len(live),
+                "dim": 0,
+                "changed": False,
+                "error": str(exc),
+            }
+        dim = len(vectors[0]) if vectors else 0
+        stored = self._stored_namespace_identity(namespace)
+        already_owned = (
+            stored is not None
+            and (canonical_provider_name(stored[0]), stored[1], stored[2])
+            == (cfg_provider, cfg_model, dim)
+            and self._live_without_completed_embedding(namespace) == 0
+        )
+        if already_owned:
+            return {**base, "reembedded": 0, "failed": 0, "dim": dim, "changed": False}
+        # Replace: purge the whole namespace, then write the new uniform identity.
+        for memory_id, _content in contents:
+            self._purge_memory_vectors(memory_id, namespace)
+        self.conn.commit()
+        self.vector_index.reset()
+        reembedded = 0
+        for (memory_id, content), vector in zip(contents, vectors):
+            self._create_embedding_record(memory_id, content, precomputed_vector=vector)
+            reembedded += 1
+        LOGGER.info(
+            "reembed completed namespace=%s reembedded=%s provider=%s model=%s dim=%s",
+            namespace,
+            reembedded,
+            cfg_provider,
+            cfg_model,
+            dim,
+        )
+        return {**base, "reembedded": reembedded, "failed": 0, "dim": dim, "changed": True}
+
+    def embedding_status(self) -> dict[str, Any]:
+        """Report the configured identity and per-namespace stored identities
+        without loading the embedding model — makes an accidental
+        provider/model mismatch visible before a request fails."""
+        cfg_provider, cfg_model = self._configured_identity()
+        rows = self.conn.execute(
+            """
+            SELECT m.namespace AS namespace, e.provider AS provider, e.model AS model,
+                   ev.dim AS dim, COUNT(*) AS n
+            FROM embedding_vectors ev
+            JOIN embeddings e ON e.embedding_id = ev.embedding_id
+            JOIN memories m ON m.id = e.memory_id
+            WHERE ev.vector IS NOT NULL AND m.deleted_at IS NULL
+            GROUP BY m.namespace, e.provider, e.model, ev.dim
+            ORDER BY m.namespace
+            """
+        ).fetchall()
+        return {
+            "configured": {"provider": cfg_provider, "model": cfg_model},
+            "namespaces": [
+                {
+                    "namespace": row["namespace"],
+                    "provider": row["provider"],
+                    "model": row["model"],
+                    "dim": row["dim"],
+                    "count": row["n"],
+                }
+                for row in rows
+            ],
+        }
 
     def close(self) -> None:
         self.conn.close()
