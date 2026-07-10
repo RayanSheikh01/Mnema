@@ -98,6 +98,28 @@ so a provider failure leaves the old namespace untouched; forgotten
 (tombstoned) memories are never re-embedded; re-running with an
 already-owned identity reports zero changes.
 
+## Summaries
+
+`memory.summarize` turns episodes into a first-class `summary` note. The prose is
+produced by a pluggable `SummaryGenerator`, selected with `MNEMA_SUMMARY_PROVIDER`
+(or `summary_provider` in TOML):
+
+- `extractive` (default) — offline, dependency-free bullet excerpts.
+- `openai` — chat-completion synthesis (`gpt-4o-mini` default). Needs
+  `OPENAI_API_KEY` and the `[openai]` extra.
+- `anthropic` / `claude` — Claude synthesis (`claude-haiku-4-5` default — cheap
+  for a bounded task). Needs `ANTHROPIC_API_KEY` and the `[anthropic]` extra.
+
+```powershell
+pip install -e .[anthropic]
+$env:MNEMA_SUMMARY_PROVIDER = "anthropic"   # or "openai"
+```
+
+The LLM writes only the summary body; Mnema always composes the topic header and
+the `Derived From` wikilinks deterministically from SQLite, so a summary can
+never invent a source link. Remote providers send note contents to the API;
+`extractive` keeps everything local.
+
 ## Vector search backends
 
 Recall is powered by a pluggable vector index, selected with
