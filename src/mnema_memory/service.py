@@ -22,6 +22,20 @@ from .vector_index import VectorIndex, build_vector_index
 LOGGER = logging.getLogger("mnema_memory")
 
 
+def _link_target_id(raw: str) -> str:
+    """Extract the memory_id from any stored link form: ``[[id]]``,
+    ``[[<ts>--<slug>--<id>|Title]]``, or a bare id/alias. The ``--`` separator
+    only appears between filename segments, so the id is the tail after the last
+    ``--`` (memory_ids themselves contain single hyphens only)."""
+    inner = raw.strip().strip('"')
+    if inner.startswith("[[") and inner.endswith("]]"):
+        inner = inner[2:-2]
+    inner = inner.split("|", 1)[0].strip()
+    if "--" in inner:
+        return inner.rsplit("--", 1)[1]
+    return inner
+
+
 class MemoryService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -74,8 +88,11 @@ class MemoryService:
             "tags": sorted(set(memory_input.tags)),
             "importance": memory_input.importance,
             "embedding_id": None,
-            # Store as [[memory_id]] wikilinks so Obsidian's graph draws edges.
-            "links": [f"[[{item}]]" for item in payload.get("links", [])],
+            # Store as [[filename|title]] wikilinks so Obsidian resolves them by
+            # filename. A bare [[memory_id]] only resolves via the note's alias,
+            # which is fragile (unindexed alias -> ghost link that spawns a new
+            # note on click).
+            "links": [self._wikilink_for(item) for item in payload.get("links", [])],
         }
         extra_frontmatter = payload.get("extra_frontmatter", {})
         if not isinstance(extra_frontmatter, dict):
@@ -342,7 +359,7 @@ class MemoryService:
                 *bullets,
                 "",
                 "### Derived From",
-                *[f"- [[{row['id']}]]" for row in source_rows],
+                *[f"- {self._wikilink_for(row['id'])}" for row in source_rows],
             ]
         )
         result = self._remember_tool(
@@ -599,6 +616,20 @@ class MemoryService:
             body = text
         return body[:max_chars]
 
+    def _wikilink_for(self, memory_id: str) -> str:
+        """Render a wikilink Obsidian resolves by filename.
+
+        Targets the note's basename (always filename-resolvable) with its title
+        as display text: ``[[<ts>--<slug>--<id>|Title]]``. Falls back to a bare
+        ``[[memory_id]]`` (alias-resolved) when the target isn't indexed yet —
+        e.g. a forward reference written at remember time."""
+        row = self.conn.execute(
+            "SELECT path, title FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            return f"[[{memory_id}]]"
+        return f"[[{Path(row['path']).stem}|{row['title']}]]"
+
     def _upsert_frontmatter_link(self, note_path: Path, linked_memory_id: str) -> None:
         text = note_path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -617,7 +648,7 @@ class MemoryService:
                 link_line_index = idx
                 break
         if link_line_index is None:
-            lines.insert(end_index, f'links: ["[[{linked_memory_id}]]"]')
+            lines.insert(end_index, f'links: ["{self._wikilink_for(linked_memory_id)}"]')
         else:
             current = lines[link_line_index].split(":", 1)[1].strip()
             existing: list[str] = []
@@ -625,15 +656,13 @@ class MemoryService:
                 raw_values = current[1:-1].strip()
                 if raw_values:
                     for item in raw_values.split(","):
-                        # Normalize to the bare id whether stored as "id" or "[[id]]".
-                        inner = item.strip().strip('"')
-                        if inner.startswith("[[") and inner.endswith("]]"):
-                            inner = inner[2:-2]
-                        existing.append(inner)
+                        # Normalize to the bare id whatever the stored form
+                        # ([[id]], [[filename|title]], or a legacy id).
+                        existing.append(_link_target_id(item))
             if linked_memory_id not in existing:
                 existing.append(linked_memory_id)
-            # Re-serialize as [[id]] wikilinks so Obsidian's graph draws edges.
-            serialized = ", ".join(f'"[[{item}]]"' for item in existing)
+            # Re-serialize as [[filename|title]] wikilinks that resolve by filename.
+            serialized = ", ".join(f'"{self._wikilink_for(item)}"' for item in existing)
             lines[link_line_index] = f"links: [{serialized}]"
         write_atomic(note_path, "\n".join(lines) + "\n")
 

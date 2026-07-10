@@ -76,22 +76,25 @@ def test_vault_notes_are_dataview_and_graph_ready() -> None:
         float(frontmatter["importance"])  # importance must be a real number
 
     # Link produced reciprocal backlinks in both episodes' frontmatter,
-    # stored as [[id]] wikilinks so Obsidian's graph draws edges.
-    fa, _ = parse_frontmatter(Path(_path_of(svc, a["memory_id"])))
-    fb, _ = parse_frontmatter(Path(_path_of(svc, b["memory_id"])))
-    assert f"[[{b['memory_id']}]]" in fa["links"]
-    assert f"[[{a['memory_id']}]]" in fb["links"]
+    # stored as [[filename|title]] wikilinks that Obsidian resolves by filename
+    # (not by fragile alias).
+    path_a = Path(_path_of(svc, a["memory_id"]))
+    path_b = Path(_path_of(svc, b["memory_id"]))
+    fa, _ = parse_frontmatter(path_a)
+    fb, _ = parse_frontmatter(path_b)
+    assert f"[[{path_b.stem}|" in fa["links"]
+    assert f"[[{path_a.stem}|" in fb["links"]
 
-    # Every note aliases its own memory_id so [[memory_id]] wikilinks resolve.
+    # Every note still aliases its own memory_id (harmless, kept for back-compat).
     assert a["memory_id"] in fa["aliases"]
     assert b["memory_id"] in fb["aliases"]
 
-    # Summary is a first-class note that links its sources via graph wikilinks.
+    # Summary is a first-class note that links its sources by filename wikilink.
     summary_fm, summary_body = parse_frontmatter(Path(_path_of(svc, summary["memory_id"])))
     assert summary_fm["type"].strip('"') == "summary"
     assert "derived_from" in summary_fm
-    assert f"[[{a['memory_id']}]]" in summary_body
-    assert f"[[{b['memory_id']}]]" in summary_body
+    assert f"[[{path_a.stem}|" in summary_body
+    assert f"[[{path_b.stem}|" in summary_body
     svc.close()
 
 
