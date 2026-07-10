@@ -306,17 +306,18 @@ class MemoryService:
         for row in rows:
             created_at = datetime.fromisoformat(row["timestamp"])
             age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
-            recency_score = 1.0 / (1.0 + age_days)
+            # Exponential decay: the recency term halves every half_life days.
+            recency_score = 0.5 ** (age_days / self.config.recency_half_life_days)
             vector_score = score_by_embedding.get(row["embedding_id"], 0.0)
             tag_score = 0.0
             if query_tags:
                 overlap = query_tags & tags_by_memory.get(row["id"], set())
                 tag_score = len(overlap) / len(query_tags)
             final_score = (
-                (0.6 * vector_score)
-                + (0.2 * recency_score)
-                + (0.1 * row["importance"])
-                + (0.1 * tag_score)
+                (self.config.rank_weight_vector * vector_score)
+                + (self.config.rank_weight_recency * recency_score)
+                + (self.config.rank_weight_importance * row["importance"])
+                + (self.config.rank_weight_tag * tag_score)
             )
             excerpt = self._read_excerpt(Path(row["path"]))
             results.append(
@@ -664,6 +665,73 @@ class MemoryService:
             ],
         }
 
+    def apply_retention(
+        self, namespace: str | None = None, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Forget live memories past the retention policy (old AND low-importance).
+
+        Reuses the v3 forget path, so every swept memory is a reversible
+        tombstone: recoverable with ``unforget`` and honored across a rebuild —
+        never a hard delete. Summaries are exempt by default. ``dry_run`` lists
+        the candidates and mutates nothing."""
+        if not self.config.retention_enabled:
+            return {"namespace": namespace, "scanned": 0, "candidates": [], "forgotten": 0, "dry_run": dry_run}
+        now = datetime.now(tz=timezone.utc)
+        where = ["deleted_at IS NULL"]
+        params: list[Any] = []
+        if namespace is not None:
+            self._validate_namespace(namespace)
+            where.append("namespace = ?")
+            params.append(namespace)
+        if self.config.retention_exempt_summaries:
+            where.append("type != 'summary'")
+        rows = self.conn.execute(
+            "SELECT id, namespace, type, timestamp, importance, title FROM memories "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            age_days = max(
+                (now - datetime.fromisoformat(row["timestamp"])).total_seconds() / 86400.0,
+                0.0,
+            )
+            if (
+                age_days >= self.config.retention_max_age_days
+                and row["importance"] < self.config.retention_min_importance
+            ):
+                candidates.append(
+                    {
+                        "memory_id": row["id"],
+                        "namespace": row["namespace"],
+                        "title": row["title"],
+                        "age_days": round(age_days, 2),
+                        "importance": row["importance"],
+                    }
+                )
+        forgotten = 0
+        if not dry_run:
+            for candidate in candidates:
+                self._forget_tool(
+                    {"namespace": candidate["namespace"], "memory_id": candidate["memory_id"]}
+                )
+                forgotten += 1
+        LOGGER.info(
+            "retention sweep namespace=%s scanned=%s candidates=%s forgotten=%s dry_run=%s",
+            namespace,
+            len(rows),
+            len(candidates),
+            forgotten,
+            dry_run,
+        )
+        return {
+            "namespace": namespace,
+            "scanned": len(rows),
+            "candidates": candidates,
+            "forgotten": forgotten,
+            "dry_run": dry_run,
+        }
+
     def close(self) -> None:
         self.conn.close()
 
@@ -676,18 +744,38 @@ class MemoryService:
         )
         namespace = str(payload.get("namespace", self.config.default_namespace))
         self._validate_namespace(namespace)
+        tags = [str(tag) for tag in payload.get("tags", [])]
+        memory_type = str(payload.get("type", "episode"))
+        content = str(payload["content"])
         return MemoryInput(
             namespace=namespace,
             agent_id=str(payload["agent_id"]),
-            content=str(payload["content"]),
+            content=content,
             title=payload.get("title"),
             session_id=payload.get("session_id"),
             source=str(payload.get("source", "chat")),
-            tags=[str(tag) for tag in payload.get("tags", [])],
-            importance=float(payload.get("importance", 0.5)),
-            memory_type=str(payload.get("type", "episode")),  # type: ignore[arg-type]
+            tags=tags,
+            importance=self._resolve_importance(payload, content, tags, memory_type),
+            memory_type=memory_type,  # type: ignore[arg-type]
             timestamp=timestamp,
         )
+
+    def _resolve_importance(
+        self, payload: dict[str, Any], content: str, tags: list[str], memory_type: str
+    ) -> float:
+        """An explicit caller ``importance`` always wins. Otherwise fall back to
+        the flat 0.5 default, or — when ``auto_importance`` is on — a bounded
+        local heuristic (no network, no LLM)."""
+        if payload.get("importance") is not None:
+            return float(payload["importance"])
+        if not self.config.auto_importance:
+            return 0.5
+        score = 0.4
+        score += min(len(content) / 2000.0, 0.2)  # up to +0.2 for longer notes
+        score += min(len(tags) * 0.05, 0.2)  # up to +0.2 for well-tagged notes
+        if memory_type == "summary":
+            score += 0.2  # distilled summaries are worth keeping
+        return max(0.0, min(1.0, round(score, 4)))
 
     def _build_note_path(
         self,

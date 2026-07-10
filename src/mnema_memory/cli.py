@@ -61,6 +61,17 @@ def main() -> None:
         help="Report the configured embedding identity and per-namespace stored identities",
     )
     parser.add_argument(
+        "--retention",
+        action="store_true",
+        help="Forget old, low-importance memories per the retention policy "
+        "(reversible via unforget). Optionally scope with --namespace.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --retention, list what would be forgotten without changing anything",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Run as an MCP stdio server so external apps can call the memory tools",
@@ -99,6 +110,20 @@ def main() -> None:
                 f"  {ns['namespace']}: provider={ns['provider']} model={ns['model']} "
                 f"dim={ns['dim']} count={ns['count']}"
             )
+    elif args.retention:
+        result = service.apply_retention(namespace=args.namespace, dry_run=args.dry_run)
+        verb = "would forget" if result["dry_run"] else "forgot"
+        print(
+            f"retention: scanned={result['scanned']} {verb}={len(result['candidates'])}"
+            + (f" namespace={result['namespace']}" if result["namespace"] else "")
+        )
+        for candidate in result["candidates"]:
+            print(
+                f"  {candidate['memory_id']} age_days={candidate['age_days']} "
+                f"importance={candidate['importance']} title={candidate['title']!r}"
+            )
+        if not result["dry_run"] and result["forgotten"]:
+            print(f"  reverse any of these with: memory.unforget (forgotten={result['forgotten']})")
     elif args.reembed:
         if not args.namespace:
             parser.error("--reembed requires --namespace")
