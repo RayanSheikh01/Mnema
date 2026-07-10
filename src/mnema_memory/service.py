@@ -21,6 +21,7 @@ from .ids import generate_memory_id, slugify
 from .mcp import ToolRouter
 from .renderer import render_note
 from .schemas import MemoryInput
+from .summarizer import SummaryGenerator, build_summary_generator
 from .vector_index import VectorIndex, build_vector_index
 
 
@@ -57,6 +58,9 @@ class MemoryService:
         )
         self.vector_index: VectorIndex = build_vector_index(
             config.vector_backend, self.conn, config
+        )
+        self.summary_generator: SummaryGenerator = build_summary_generator(
+            config.summary_provider, config.summary_model
         )
         self.router = ToolRouter()
         self._register_tools()
@@ -358,18 +362,21 @@ class MemoryService:
         ).fetchall()
         if not source_rows:
             raise ValueError("no matching memories found for summary")
-        bullets: list[str] = []
-        for row in source_rows:
-            excerpt = self._read_excerpt(Path(row["path"]), max_chars=160)
-            bullets.append(f"- {row['title']}: {excerpt}")
         topic = str(payload.get("topic", "session-summary"))
+        # Hand full note bodies to the summary generator; it returns the
+        # '### Key Points' body. Links stay deterministic (composed below from
+        # SQLite), so the LLM never invents a Derived From reference.
+        sources = [
+            {"title": row["title"], "content": self._note_body(Path(row["path"]))}
+            for row in source_rows
+        ]
+        body = self.summary_generator.summarize(topic, sources)
         summary_title = payload.get("title") or f"Summary: {topic}"
         summary_content = "\n".join(
             [
                 f"## Summary Topic: {topic}",
                 "",
-                "### Key Points",
-                *bullets,
+                body,
                 "",
                 "### Derived From",
                 *[f"- {self._wikilink_for(row['id'])}" for row in source_rows],
