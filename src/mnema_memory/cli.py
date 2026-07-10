@@ -38,6 +38,29 @@ def main() -> None:
         help="Retry pending/failed embeddings (e.g. after a provider outage)",
     )
     parser.add_argument(
+        "--reembed",
+        action="store_true",
+        help="Re-embed a namespace with the configured provider/model (use to migrate "
+        "a namespace to a new embedding model). Requires --namespace.",
+    )
+    parser.add_argument(
+        "--namespace",
+        type=str,
+        default=None,
+        help="Namespace to operate on (required by --reembed)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Embedding batch size for --reembed (defaults to local_batch_size)",
+    )
+    parser.add_argument(
+        "--embedding-status",
+        action="store_true",
+        help="Report the configured embedding identity and per-namespace stored identities",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Run as an MCP stdio server so external apps can call the memory tools",
@@ -65,6 +88,36 @@ def main() -> None:
     elif args.drain_embeddings:
         result = service.process_pending_embeddings()
         print("embedding drain:", f"recovered={result['recovered']} failed={result['failed']}")
+    elif args.embedding_status:
+        status = service.embedding_status()
+        cfg = status["configured"]
+        print(f"configured: provider={cfg['provider']} model={cfg['model']}")
+        if not status["namespaces"]:
+            print("  (no stored embeddings yet)")
+        for ns in status["namespaces"]:
+            print(
+                f"  {ns['namespace']}: provider={ns['provider']} model={ns['model']} "
+                f"dim={ns['dim']} count={ns['count']}"
+            )
+    elif args.reembed:
+        if not args.namespace:
+            parser.error("--reembed requires --namespace")
+        result = service.reembed(args.namespace, batch_size=args.batch_size)
+        if result.get("failed"):
+            print(
+                "reembed FAILED (namespace left unchanged):",
+                f"namespace={result['namespace']} failed={result['failed']}",
+            )
+            if result.get("error"):
+                print("  error:", result["error"])
+        else:
+            print(
+                "reembed completed:",
+                f"namespace={result['namespace']} scanned={result['scanned']} "
+                f"reembedded={result['reembedded']} skipped_deleted={result['skipped_deleted']} "
+                f"provider={result['provider']} model={result['model']} dim={result['dim']} "
+                f"changed={result['changed']}",
+            )
     else:
         print("mnema-memory server initialized")
         print("registered tools:", ", ".join(service.router.tool_names))
