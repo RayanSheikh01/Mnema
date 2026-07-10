@@ -674,6 +674,8 @@ class MemoryService:
         tombstone: recoverable with ``unforget`` and honored across a rebuild —
         never a hard delete. Summaries are exempt by default. ``dry_run`` lists
         the candidates and mutates nothing."""
+        if not self.config.retention_enabled:
+            return {"namespace": namespace, "scanned": 0, "candidates": [], "forgotten": 0, "dry_run": dry_run}
         now = datetime.now(tz=timezone.utc)
         where = ["deleted_at IS NULL"]
         params: list[Any] = []
