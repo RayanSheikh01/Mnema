@@ -35,6 +35,8 @@ class AppConfig:
     default_namespace: str = "default/project/dev"
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-small"
+    summary_provider: str = "extractive"
+    summary_model: str = ""
     local_model_cache: Path | None = None
     local_files_only: bool = False
     local_device: str | None = None
@@ -72,6 +74,12 @@ class AppConfig:
         )
         embedding_model = os.environ.get(
             "MNEMA_EMBEDDING_MODEL", file_data.get("embedding_model", "text-embedding-3-small")
+        )
+        summary_provider = os.environ.get(
+            "MNEMA_SUMMARY_PROVIDER", file_data.get("summary_provider", "extractive")
+        )
+        summary_model = os.environ.get(
+            "MNEMA_SUMMARY_MODEL", file_data.get("summary_model", "")
         )
         local_model_cache_raw = os.environ.get(
             "MNEMA_LOCAL_MODEL_CACHE", file_data.get("local_model_cache")
@@ -120,6 +128,8 @@ class AppConfig:
             default_namespace=default_namespace,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            summary_provider=summary_provider,
+            summary_model=summary_model,
             local_model_cache=local_model_cache,
             local_files_only=local_files_only,
             local_device=local_device,

@@ -12,6 +12,7 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 openai = ["openai>=1.35.0"]
+anthropic = ["anthropic>=0.40"]
 local = ["sentence-transformers>=3.0"]
 ann = ["hnswlib>=0.8.0"]
 test = ["pytest>=8.0.0", "hnswlib>=0.8.0"]
