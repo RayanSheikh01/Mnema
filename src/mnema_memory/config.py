@@ -47,6 +47,19 @@ class AppConfig:
     hnsw_m: int = 16
     hnsw_ef_construction: int = 200
     hnsw_ef: int = 64
+    # Recall ranking (defaults reproduce the pre-v6 hardcoded blend).
+    rank_weight_vector: float = 0.6
+    rank_weight_recency: float = 0.2
+    rank_weight_importance: float = 0.1
+    rank_weight_tag: float = 0.1
+    recency_half_life_days: float = 1.0
+    # Write-time importance heuristic (opt-in; explicit caller value always wins).
+    auto_importance: bool = False
+    # Retention sweep (opt-in; reversible forget, never hard-delete).
+    retention_enabled: bool = False
+    retention_max_age_days: float = 365.0
+    retention_min_importance: float = 0.25
+    retention_exempt_summaries: bool = True
 
     @staticmethod
     def load(config_path: Path | None = None) -> "AppConfig":
@@ -122,6 +135,50 @@ class AppConfig:
         )
         hnsw_ef = int(os.environ.get("MNEMA_HNSW_EF", file_data.get("hnsw_ef", 64)))
 
+        def _float(env_key: str, toml_key: str, default: float) -> float:
+            return float(os.environ.get(env_key, file_data.get(toml_key, default)))
+
+        rank_weight_vector = _float("MNEMA_RANK_WEIGHT_VECTOR", "rank_weight_vector", 0.6)
+        rank_weight_recency = _float("MNEMA_RANK_WEIGHT_RECENCY", "rank_weight_recency", 0.2)
+        rank_weight_importance = _float(
+            "MNEMA_RANK_WEIGHT_IMPORTANCE", "rank_weight_importance", 0.1
+        )
+        rank_weight_tag = _float("MNEMA_RANK_WEIGHT_TAG", "rank_weight_tag", 0.1)
+        for name, weight in (
+            ("rank_weight_vector", rank_weight_vector),
+            ("rank_weight_recency", rank_weight_recency),
+            ("rank_weight_importance", rank_weight_importance),
+            ("rank_weight_tag", rank_weight_tag),
+        ):
+            if weight < 0:
+                raise ValueError(f"{name} must be non-negative")
+        recency_half_life_days = _float(
+            "MNEMA_RECENCY_HALF_LIFE_DAYS", "recency_half_life_days", 1.0
+        )
+        if recency_half_life_days <= 0:
+            raise ValueError("recency_half_life_days must be positive")
+        auto_importance = _bool(
+            os.environ.get("MNEMA_AUTO_IMPORTANCE", file_data.get("auto_importance")),
+            False,
+        )
+        retention_enabled = _bool(
+            os.environ.get("MNEMA_RETENTION_ENABLED", file_data.get("retention_enabled")),
+            False,
+        )
+        retention_max_age_days = _float(
+            "MNEMA_RETENTION_MAX_AGE_DAYS", "retention_max_age_days", 365.0
+        )
+        retention_min_importance = _float(
+            "MNEMA_RETENTION_MIN_IMPORTANCE", "retention_min_importance", 0.25
+        )
+        retention_exempt_summaries = _bool(
+            os.environ.get(
+                "MNEMA_RETENTION_EXEMPT_SUMMARIES",
+                file_data.get("retention_exempt_summaries"),
+            ),
+            True,
+        )
+
         return AppConfig(
             vault_root=vault_root,
             sqlite_path=sqlite_path,
@@ -140,4 +197,14 @@ class AppConfig:
             hnsw_m=hnsw_m,
             hnsw_ef_construction=hnsw_ef_construction,
             hnsw_ef=hnsw_ef,
+            rank_weight_vector=rank_weight_vector,
+            rank_weight_recency=rank_weight_recency,
+            rank_weight_importance=rank_weight_importance,
+            rank_weight_tag=rank_weight_tag,
+            recency_half_life_days=recency_half_life_days,
+            auto_importance=auto_importance,
+            retention_enabled=retention_enabled,
+            retention_max_age_days=retention_max_age_days,
+            retention_min_importance=retention_min_importance,
+            retention_exempt_summaries=retention_exempt_summaries,
         )
